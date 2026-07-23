@@ -14,10 +14,16 @@ gestures are two claps — the **tempo** of the pair is the intent, not the coun
   | gap between the two claps | result |
   |---|---|
   | < 0.15 s | echo of clap 1 — ignored, still waiting for the real partner |
-  | **0.15 – 0.40 s** | **wake** |
-  | 0.40 – 0.60 s | dead zone — ignored, refuses to guess |
-  | **0.60 – 1.10 s** | **sleep** |
-  | > 1.10 s | too late to pair; that clap starts a new pair |
+  | **0.15 – 0.60 s** | **wake** |
+  | **0.60 – 1.20 s** | **sleep** |
+  | > 1.20 s | too late to pair; that clap starts a new pair |
+
+  One boundary at 0.60 s, measured from 17 real pairs: wake attempts ran
+  0.278–0.583 s, sleep attempts 0.650–1.021 s. The bands are **contiguous**, so
+  every pair resolves to an action — you never clap at a system that silently
+  ignores you. A gap sitting exactly on the boundary resolves to **wake**: a
+  stray wake is a lit screen you didn't ask for, a stray sleep is the screen
+  going black while you're using it, so the doubt lands on the harmless one.
 
 - **Why tempo and not a 3-clap sleep.** Counting made "2 claps" a *prefix* of
   "3 claps". A prefix code has to wait to learn which gesture it received, so
@@ -34,8 +40,9 @@ gestures are two claps — the **tempo** of the pair is the intent, not the coun
   the configured layout and does not type into applications.
 - Claps/snaps: onset **0.22** / re-arm **0.08** (hysteresis). Override the two
   tempo bands with `CLAPWAKE_WAKE_MIN_GAP` / `CLAPWAKE_WAKE_MAX_GAP` and
-  `CLAPWAKE_SLEEP_MIN_GAP` / `CLAPWAKE_SLEEP_MAX_GAP`. The bands must keep a
-  **≥ 0.10s dead zone** between them; the listener refuses to start otherwise.
+  `CLAPWAKE_SLEEP_MIN_GAP` / `CLAPWAKE_SLEEP_MAX_GAP`. The wake band must close
+  at or before the sleep band opens; the listener refuses to start otherwise,
+  so the two gestures can never overlap.
   Continuous audio (recording) blocked by the busy-room gate.
 - Mic unplug / CoreAudio wedge is **self-healing** (open-config matrix, backoff,
   clean process-boundary restart). Silence no longer causes stream churn.
@@ -91,13 +98,22 @@ Clap and watch the bar. `|` marks the onset threshold, `:` marks the release
 level. Every fire prints the **measured gap in ms** — that number is what you
 tune the bands against.
 
-Clap your natural fast pair ten times and read the gaps. Set
-`CLAPWAKE_WAKE_MAX_GAP` above your slowest, not at the default, and do the same
-for your slow pair with `CLAPWAKE_SLEEP_MIN_GAP`. Set them in the LaunchAgent
-environment. Values must satisfy `0.12 <= wake_min < wake_max`,
-`wake_max + 0.10 <= sleep_min < sleep_max <= 1.50` — the listener refuses to
-start if the bands touch, because a dead zone is what makes a sloppy pair do
-nothing instead of guessing.
+Clap your natural fast pair ten times, then your natural slow pair ten times,
+and read the gaps back:
+
+```bash
+grep -o '"gap_s": [0-9.]*' /tmp/clapwake.out | tail -20
+```
+
+Put the boundary in the space between the two clusters. Move it by setting
+`CLAPWAKE_WAKE_MAX_GAP` and `CLAPWAKE_SLEEP_MIN_GAP` to the same value in the
+LaunchAgent environment. Values must satisfy
+`0.12 <= wake_min < wake_max <= sleep_min < sleep_max <= 1.50`.
+
+Setting `sleep_min` *above* `wake_max` turns the space between into a dead zone
+that fires nothing. That trades stray actions for silent misses — you clap and
+nothing happens — which is usually the worse of the two. Contiguous is the
+default for that reason.
 
 ## Tests
 

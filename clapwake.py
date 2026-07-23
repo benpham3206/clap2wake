@@ -38,27 +38,41 @@ RELEASE = 0.08               # re-arm only after a real quiet (must stay << THRE
 # prefix. Both gestures are 2 claps, so intent is known the instant clap 2
 # lands: no disambiguation wait, and a 3rd onset means nothing at all.
 #
-# The bands must not touch. The gap between them is a dead zone: a sloppy pair
-# does nothing rather than guessing, which is the safe failure for a gesture
-# that can black out the screen.
+# Bands measured from Ben's own claps, 2026-07-23 (17 pairs, /tmp/clapwake.out):
+#   wake attempts   0.278 0.278 0.313 0.366 0.371 0.371 0.372 …
+#                   0.479 0.488 0.531 0.583   <- the same intent, relaxed
+#   sleep attempts  0.650 0.650 0.651 0.743 0.743 1.021
+# The natural split is 0.583 → 0.650, so the boundary sits at 0.60.
+#
+# The bands are CONTIGUOUS by default: every pair resolves to an action, none is
+# discarded. Ambiguity therefore resolves toward WAKE, which is deliberate — a
+# stray wake is a lit screen you did not ask for, a stray sleep is the screen
+# going black while you are using it. Bias the doubt at the harmless one.
+#
+# Leaving a gap between the bands is still legal (set sleep_min > wake_max) and
+# turns the space between them into a dead zone that fires nothing. That trades
+# stray actions for silent misses — the failure mode where you clap and nothing
+# happens at all. Contiguous was the better trade for Ben's hands.
 WAKE_GAP_RANGE_SECONDS = (
     float(os.environ.get("CLAPWAKE_WAKE_MIN_GAP", "0.15")),
-    float(os.environ.get("CLAPWAKE_WAKE_MAX_GAP", "0.40")),
+    float(os.environ.get("CLAPWAKE_WAKE_MAX_GAP", "0.60")),
 )
 SLEEP_GAP_RANGE_SECONDS = (
     float(os.environ.get("CLAPWAKE_SLEEP_MIN_GAP", "0.60")),
-    float(os.environ.get("CLAPWAKE_SLEEP_MAX_GAP", "1.10")),
+    float(os.environ.get("CLAPWAKE_SLEEP_MAX_GAP", "1.20")),
 )
 if not (
     0.12 <= WAKE_GAP_RANGE_SECONDS[0] < WAKE_GAP_RANGE_SECONDS[1]
-    and WAKE_GAP_RANGE_SECONDS[1] + 0.10 <= SLEEP_GAP_RANGE_SECONDS[0]
+    and WAKE_GAP_RANGE_SECONDS[1] <= SLEEP_GAP_RANGE_SECONDS[0]
     and SLEEP_GAP_RANGE_SECONDS[0] < SLEEP_GAP_RANGE_SECONDS[1] <= 1.50
 ):
     raise ValueError(
-        "clap gap bands must satisfy 0.12 <= wake_min < wake_max, "
-        "wake_max + 0.10 <= sleep_min < sleep_max <= 1.50 "
-        "(the bands need a dead zone between them)"
+        "clap gap bands must satisfy 0.12 <= wake_min < wake_max "
+        "<= sleep_min < sleep_max <= 1.50 (the wake band must close at or "
+        "before the sleep band opens)"
     )
+# True when the bands touch: no gap can fall between them, so nothing is ignored.
+BANDS_ARE_CONTIGUOUS = WAKE_GAP_RANGE_SECONDS[1] >= SLEEP_GAP_RANGE_SECONDS[0]
 # Band edges are inclusive within this tolerance. It absorbs float drift and the
 # POLL/blocksize quantisation, and it is far below human timing precision — no
 # one claps to a 5ms boundary, so a hard edge would only create phantom misses.
@@ -564,13 +578,17 @@ class ClapDetector:
             self._armed = False
             self.burst_count = 0
 
+            # gap already sits in [ECHO_GAP, PAIR_EXPIRY], so only the inner
+            # boundary is left to decide. The tolerance pads the WAKE ceiling
+            # only — never the sleep floor — so the bands cannot overlap however
+            # they are configured, and a gap sitting exactly on a shared edge
+            # resolves to wake. That is the harmless side of the doubt.
             if gap <= WAKE_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS:
-                # Already known to be >= ECHO_GAP, so this is the wake band.
                 self._cooldown_until = now + WAKE_COOLDOWN_SECONDS
                 action = "wake"
             elif (
-                gap >= SLEEP_GAP_RANGE_SECONDS[0] - GAP_EPSILON_SECONDS
-                and gap <= SLEEP_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS
+                BANDS_ARE_CONTIGUOUS
+                or gap >= SLEEP_GAP_RANGE_SECONDS[0] - GAP_EPSILON_SECONDS
             ):
                 self._cooldown_until = now + SLEEP_COOLDOWN_SECONDS
                 action = "sleep"

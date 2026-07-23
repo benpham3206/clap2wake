@@ -43,7 +43,7 @@ SLEEP_MIN, SLEEP_MAX = clapwake.SLEEP_GAP_RANGE_SECONDS
 REARM = clapwake.MIN_REARM_QUIET_SECONDS
 WAKE_GAP = (WAKE_MIN + WAKE_MAX) / 2.0     # a comfortable fast pair
 SLEEP_GAP = (SLEEP_MIN + SLEEP_MAX) / 2.0  # a comfortable slow pair
-DEAD_GAP = (WAKE_MAX + SLEEP_MIN) / 2.0    # squarely in the ignored band
+# (no default dead zone: the bands are contiguous)
 
 
 def clap(det: clapwake.ClapDetector, t: float) -> None:
@@ -105,8 +105,11 @@ def test_wake_needs_no_settle() -> None:
 
 
 def test_gesture_boundaries_are_inclusive() -> None:
+    # The shared edge belongs to wake (see test_boundary_gap_resolves_to_wake),
+    # so the first sleep gap is a hair past it.
+    first_sleep = SLEEP_MIN + (0.01 if clapwake.BANDS_ARE_CONTIGUOUS else 0.0)
     for gap, want in ((WAKE_MIN, "wake"), (WAKE_MAX, "wake"),
-                      (SLEEP_MIN, "sleep"), (SLEEP_MAX, "sleep")):
+                      (first_sleep, "sleep"), (SLEEP_MAX, "sleep")):
         det, rec = make_detector()
         pair(det, 1.0, gap)
         check(f"gap {gap:.2f}s -> {want}", rec.actions, [(want, 2)])
@@ -134,18 +137,48 @@ def test_third_onset_cannot_convert_sleep_into_wake() -> None:
 
 def test_no_gesture_is_a_prefix_of_another() -> None:
     """Structural guarantee: the wake and sleep bands cannot overlap."""
-    check("wake band closes before sleep band opens", WAKE_MAX < SLEEP_MIN, True)
-    check("dead zone is at least 100ms wide", SLEEP_MIN - WAKE_MAX >= 0.10, True)
+    check("wake band closes at or before sleep opens", WAKE_MAX <= SLEEP_MIN, True)
+
+
+def test_contiguous_bands_leave_no_gap_unanswered() -> None:
+    """Default config is contiguous: every legal pair resolves to an action."""
+    check("bands are contiguous", clapwake.BANDS_ARE_CONTIGUOUS, True)
+    gap = WAKE_MAX
+    while gap <= SLEEP_MAX - 0.01:
+        det, rec = make_detector()
+        pair(det, 1.0, gap)
+        check(f"gap {gap:.2f}s resolves to an action", len(rec.actions), 1)
+        gap += 0.05
+
+
+def test_boundary_gap_resolves_to_wake_not_sleep() -> None:
+    """Doubt at the shared edge must land on the harmless action."""
+    det, rec = make_detector()
+    pair(det, 1.0, WAKE_MAX)
+    check("gap exactly at the boundary -> wake", rec.actions, [("wake", 2)])
+
+
+def test_dead_zone_still_works_when_bands_are_separated() -> None:
+    """A configured gap between the bands must still discard the pair."""
+    saved = clapwake.SLEEP_GAP_RANGE_SECONDS, clapwake.BANDS_ARE_CONTIGUOUS
+    clapwake.SLEEP_GAP_RANGE_SECONDS = (WAKE_MAX + 0.20, SLEEP_MAX)
+    clapwake.BANDS_ARE_CONTIGUOUS = False
+    try:
+        det, rec = make_detector()
+        pair(det, 1.0, WAKE_MAX + 0.10)
+        check("separated bands -> pair discarded", rec.actions, [])
+    finally:
+        clapwake.SLEEP_GAP_RANGE_SECONDS, clapwake.BANDS_ARE_CONTIGUOUS = saved
 
 
 # --- rejection cases ---------------------------------------------------------
 
 
-def test_dead_zone_pair_is_ignored() -> None:
+def test_pair_past_sleep_max_is_not_a_gesture() -> None:
     det, rec = make_detector()
-    pair(det, 1.0, DEAD_GAP)
-    det.settle(now=1.0 + SLEEP_MAX + 0.5)
-    check("sloppy pair in dead zone -> no action", rec.actions, [])
+    pair(det, 1.0, SLEEP_MAX + 0.30)
+    det.settle(now=1.0 + SLEEP_MAX * 2 + 0.5)
+    check("pair slower than the sleep band -> no action", rec.actions, [])
 
 
 def test_echo_faster_than_wake_min_is_ignored() -> None:
@@ -256,10 +289,10 @@ def test_short_sleep_cooldown_allows_quick_rewake() -> None:
 
 def test_gesture_band_constants_are_sane() -> None:
     assert WAKE_MIN >= 0.12          # below this it is an echo, not intent
-    assert WAKE_MAX <= 0.45          # a "fast" pair must still feel fast
+    assert WAKE_MAX <= 0.65          # a "fast" pair must still feel fast
     assert SLEEP_MIN >= 0.55         # a "slow" pair must feel deliberate
     assert SLEEP_MAX <= 1.50         # beyond this it is two separate claps
-    assert WAKE_MAX < SLEEP_MIN
+    assert WAKE_MAX <= SLEEP_MIN
     check(
         "clapwake exposes both bands",
         (clapwake.WAKE_GAP_RANGE_SECONDS, clapwake.SLEEP_GAP_RANGE_SECONDS),
@@ -306,7 +339,10 @@ def main() -> int:
         test_third_onset_cannot_convert_wake_into_sleep,
         test_third_onset_cannot_convert_sleep_into_wake,
         test_no_gesture_is_a_prefix_of_another,
-        test_dead_zone_pair_is_ignored,
+        test_pair_past_sleep_max_is_not_a_gesture,
+        test_contiguous_bands_leave_no_gap_unanswered,
+        test_boundary_gap_resolves_to_wake_not_sleep,
+        test_dead_zone_still_works_when_bands_are_separated,
         test_echo_faster_than_wake_min_is_ignored,
         test_echo_does_not_consume_the_real_second_clap,
         test_onset_slower_than_sleep_max_starts_a_new_pair,

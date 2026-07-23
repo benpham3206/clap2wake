@@ -153,6 +153,23 @@ def main() -> int:
     events = load_json_lines(LOG_OUT)
     err_events = load_json_lines(LOG_ERR)
 
+    # Both logs are append-only across restarts, so errors from a previous run
+    # would otherwise be reported forever and mask the state of the current one.
+    # Keep only stderr entries at or after the newest service_start.
+    started_at = max(
+        (
+            str(e.get("ts"))
+            for e in events
+            if e.get("event") == "service_start" and e.get("ts")
+        ),
+        default="",
+    )
+    if started_at:
+        err_events = [
+            e for e in err_events if str(e.get("ts", "")) >= started_at
+        ]
+        notes.append(f"since_start={started_at}")
+
     if not LOG_OUT.is_file():
         problems.append(f"missing log {LOG_OUT}")
     else:
