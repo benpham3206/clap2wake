@@ -11,8 +11,12 @@ the LaunchAgent uses (`/tmp/clapwake.out`) with source=scope, so you can:
 
     tail -f /tmp/clapwake.out
 
+Gestures are tempo pairs: a fast pair wakes, a slow pair sleeps, and a pair
+landing between the bands is ignored. Every fire prints the measured gap in ms,
+which is what you tune the bands against.
+
 On exit, scope always re-bootstraps com.you.clapwake (not only if pause
-succeeded). Leaving the LaunchAgent unloaded is what made triple-clap sleep
+succeeded). Leaving the LaunchAgent unloaded is what made the sleep gesture
 appear broken after a scope session.
 
 Run:  ~/clapwake/.venv/bin/python3 ~/clapwake/scope.py
@@ -160,7 +164,13 @@ class Meter:
         self.peak_hold = 0.0
         self.peak_hold_at = 0.0
 
-    def _record(self, _commands: list[list[str]], action: str, count: int) -> None:
+    def _record(
+        self,
+        _commands: list[list[str]],
+        action: str,
+        count: int,
+        gap: float = 0.0,
+    ) -> None:
         self.last_fire = (action, count, time.monotonic())
         # Same shape as clapwake.ClapDetector._run event lines, plus source=scope.
         log_event(
@@ -168,11 +178,14 @@ class Meter:
                 "component": "clapwake.detector",
                 "event": f"{action}_triggered",
                 "clap_count": count,
+                "gap_s": round(gap, 3),
             }
         )
         # Break the \r meter line so the fire is visible in the terminal too.
+        # The gap is what you are tuning now, so lead with it.
         sys.stdout.write(
-            f"\n>> {action.upper()} would fire ({count} claps)  [logged → {LOG_PATH}]\n"
+            f"\n>> {action.upper()} would fire  —  gap {gap * 1000:.0f}ms"
+            f"  [logged → {LOG_PATH}]\n"
         )
         sys.stdout.flush()
 
