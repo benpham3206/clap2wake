@@ -23,10 +23,9 @@ a new pair. There is no fast-for-wake or slow-for-sleep split.
 - Read-back checks log `sleep_verify` or `wake_verify`. A mismatch can trigger up
   to four extra brightness commands. Exhaustion logs an `*_unverified` error.
   The final extra command is not followed by another check.
-- Dimming requires an unlocked session. A pair during recent keyboard or mouse
-  input logs `sleep_suppressed`. A second pair inside three seconds is treated
-  as intent and logs `sleep_triggered` with `hid_confirm`. The listener ignores
-  its own wake HID events. Wake does not use this guard.
+- Dimming requires an unlocked session. The login window logs `sleep_suppressed`.
+  Recent keyboard or mouse input does not block a clap pair. Wake does not use
+  this guard.
 - Onset threshold is `0.35`; release level is `0.08`. Quiet rearming, echo
   rejection, and a busy-room gate reduce false triggers from tails and audio.
 - Capture stays pinned to the Scarlett by name. The listener retries missing
@@ -86,7 +85,6 @@ LaunchAgent environment overrides:
 - `CLAPWAKE_MIC_NAME`: preferred microphone name substring; default `Scarlett`.
 - `CLAPWAKE_WAKE_MIN_GAP` / `CLAPWAKE_WAKE_MAX_GAP`: the shared pair window.
   Bounds must satisfy `0.12 <= min < max <= 1.50`.
-- `CLAPWAKE_SLEEP_HID_IDLE`: minimum human-input idle time; default `3.0` seconds.
 
 Logs are `/tmp/clapwake.out` and `/tmp/clapwake.err`. A trigger records a request;
 read-back records whether both brightness channels reached their target range.

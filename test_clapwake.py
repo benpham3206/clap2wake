@@ -306,13 +306,12 @@ def test_gesture_band_constants_are_sane() -> None:
     )
 
 
-# --- sleep is gated on "is a human at the keyboard right now?" ---------------
+# --- sleep is gated on the login window, not recent HID ----------------------
 
 
 def run_sleep_gate(
     idle: float,
     locked: bool,
-    own_hid_age: float | None = None,
     levels: list[tuple[float, float]] | None = None,
     det: clapwake.ClapDetector | None = None,
 ) -> list[str]:
@@ -326,8 +325,6 @@ def run_sleep_gate(
     det._launch_commands = (  # type: ignore[method-assign]
         lambda commands, action, t0, pulse: launched.append(action)
     )
-    if own_hid_age is not None:
-        det._own_hid_mono = time.monotonic() - own_hid_age
     reads = list(levels) if levels is not None else [(0.0, 0.0)]
     exhausted = reads[-1]
     saved = (
@@ -354,40 +351,9 @@ def run_sleep_gate(
     return launched
 
 
-def test_sleep_blocked_while_typing() -> None:
-    """18:51:06 — typing a password slept the display. Must not happen again."""
-    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
-    check("recent keystroke -> sleep suppressed", run_sleep_gate(idle, False), [])
-
-
-def test_second_pair_confirms_hid_suppressed_sleep() -> None:
-    """11:43:01 then 11:43:02 — two heard pairs were dropped by recent_hid_input."""
-    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
-    det = clapwake.ClapDetector()
-    check(
-        "first pair while HID is hot -> suppressed",
-        run_sleep_gate(idle, False, det=det),
-        [],
-    )
-    check(
-        "immediate retry is intent, not a process restart",
-        run_sleep_gate(idle, False, det=det),
-        ["sleep"],
-    )
-
-
-def test_hid_confirm_expires_with_the_idle_window() -> None:
-    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
-    det = clapwake.ClapDetector()
-    run_sleep_gate(idle, False, det=det)
-    det._hid_suppressed_at = time.monotonic() - (
-        clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS + 0.1
-    )
-    check(
-        "stale suppress is not a confirm",
-        run_sleep_gate(idle, False, det=det),
-        [],
-    )
+def test_first_pair_while_hid_hot_still_sleeps() -> None:
+    """11:52:43 — first desk pair was sleep_suppressed; later pairs worked."""
+    check("first pair with recent HID -> sleep", run_sleep_gate(0.75, False), ["sleep"])
 
 
 def test_sleep_blocked_at_the_login_window() -> None:
@@ -395,8 +361,7 @@ def test_sleep_blocked_at_the_login_window() -> None:
 
 
 def test_sleep_fires_when_the_desk_is_idle() -> None:
-    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS + 1.0
-    check("idle + unlocked -> sleep fires", run_sleep_gate(idle, False), ["sleep"])
+    check("idle + unlocked -> sleep fires", run_sleep_gate(4.0, False), ["sleep"])
 
 
 def test_sleep_is_ddc_luminance_zero_not_os_display_sleep() -> None:
@@ -424,19 +389,11 @@ def test_unknown_hid_idle_does_not_suppress() -> None:
 
 def test_sleep_after_own_wake_hid_still_fires() -> None:
     """09:48:59 — sleep after a successful wake was dropped by clapwake-hid."""
-    check(
-        "own wake HID 1.27s ago is not a human at the keyboard",
-        run_sleep_gate(1.27, False, own_hid_age=1.27),
-        ["sleep"],
-    )
+    check("sleep after recent wake HID still fires", run_sleep_gate(1.27, False), ["sleep"])
 
 
-def test_human_hid_after_own_wake_still_blocks() -> None:
-    check(
-        "a real key newer than our wake HID still suppresses",
-        run_sleep_gate(0.20, False, own_hid_age=1.50),
-        [],
-    )
+def test_human_hid_after_own_wake_still_sleeps() -> None:
+    check("a real key after wake HID still sleeps", run_sleep_gate(0.20, False), ["sleep"])
 
 
 # --- actions are durable: re-fired until the panel reads back at target -----
@@ -738,15 +695,13 @@ def main() -> int:
         test_sleep_works_after_wake_cooldown,
         test_short_sleep_cooldown_allows_quick_rewake,
         test_gesture_band_constants_are_sane,
-        test_sleep_blocked_while_typing,
-        test_second_pair_confirms_hid_suppressed_sleep,
-        test_hid_confirm_expires_with_the_idle_window,
+        test_first_pair_while_hid_hot_still_sleeps,
         test_sleep_blocked_at_the_login_window,
         test_sleep_fires_when_the_desk_is_idle,
         test_sleep_is_ddc_luminance_zero_not_os_display_sleep,
         test_unknown_hid_idle_does_not_suppress,
         test_sleep_after_own_wake_hid_still_fires,
-        test_human_hid_after_own_wake_still_blocks,
+        test_human_hid_after_own_wake_still_sleeps,
         test_sleep_retries_until_panel_reads_dark,
         test_sleep_gives_up_after_bounded_retries,
         test_levels_are_dark_reads_either_channel,

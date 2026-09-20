@@ -737,3 +737,20 @@ Not committed (left as local dirty tree for Ben).
   with `hid_confirm: true`.
 - Watchdog `com.you.clapwake.watchdog` remains the process restarter.
   Do not kickstart on `sleep_suppressed`.
+
+---
+
+# Part 20: First desk pair must sleep (2026-09-20)
+
+## Verdict
+
+- 11:52:43 first pair was `sleep_suppressed` `recent_hid_input`
+  (idle 0.75s). 11:52:45 retry slept with `hid_confirm`. Later toggles
+  worked because wake F18 looked like "our" HID. The first clap of a
+  session had no such exemption.
+
+## What changed
+
+- Sleep no longer gates on HID idle. A clap pair on a lit panel sleeps.
+- Login window still suppresses. THRESH and the busy-room gate stay.
+- Removed `_hid_suppressed_at`, `_own_hid_mono`, and `hid_confirm`.

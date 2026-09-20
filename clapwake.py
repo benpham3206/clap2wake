@@ -60,15 +60,6 @@ MAX_BUSY_FRACTION = 0.25
 MIN_BUSY_SAMPLES = 30
 WAKE_COOLDOWN_SECONDS = 2.5
 SLEEP_COOLDOWN_SECONDS = 0.4
-# Sleep only fires if no real key/mouse event happened this recently. A person
-# typing is not clapping; the mic just hears their keyboard through the desk.
-# A second pair inside this window is intent (11:43:01 then 11:43:02).
-SLEEP_REQUIRES_HID_IDLE_SECONDS = float(
-    os.environ.get("CLAPWAKE_SLEEP_HID_IDLE", "3.0")
-)
-# CGEvent idle and our monotonic stamp can disagree by a beat. Stay under a
-# keystroke gap so a real key after our F18 still counts as human.
-OWN_HID_MATCH_SLACK_SECONDS = 0.35
 ACTION_COOLDOWN_SECONDS = WAKE_COOLDOWN_SECONDS
 
 # Both gestures are two claps. The count is no longer what distinguishes them.
@@ -600,11 +591,6 @@ class ClapDetector:
         self._wake_gen_lock = threading.Lock()
         # Recent (timestamp, is_active) samples for the busy-environment gate.
         self._activity: deque[tuple[float, bool]] = deque()
-        # Last time this process posted HID (wake train). Sleep must not treat
-        # that as a human at the keyboard (09:48:59 sleep_suppressed after wake).
-        self._own_hid_mono = 0.0
-        # Last HID-gated sleep. A second pair inside the idle window confirms.
-        self._hid_suppressed_at = 0.0
 
     def _bump_wake_generation(self) -> int:
         """Invalidate prior cold-wake trains; return the new generation id."""
@@ -826,51 +812,28 @@ class ClapDetector:
         count: int,
         gap: float,
     ) -> None:
-        """Dim when unlocked. First recent-HID pair is dropped; the next confirms.
+        """Dim when the session is unlocked.
 
-        Desk-mounted microphones can hear keystrokes as claps. Ignore the wake
-        helper's own HID events. A second pair inside the idle window is intent.
+        Recent keyboard or mouse input used to drop the first pair
+        (11:52:43 sleep_suppressed). A clap pair is now the intent.
+        The login window still blocks.
         """
         idle = hid_idle_seconds()
         locked = screen_is_locked()
-        now = time.monotonic()
-        # idle < 0 means the query failed; do not suppress on an unknown answer.
-        recent_input = 0.0 <= idle < SLEEP_REQUIRES_HID_IDLE_SECONDS
-        hid_confirm = False
-        if recent_input and self._own_hid_mono > 0:
-            own_age = now - self._own_hid_mono
-            # Last HID is not newer than our wake post → it is our F18, not Ben.
-            if idle + OWN_HID_MATCH_SLACK_SECONDS >= own_age:
-                recent_input = False
-        if (
-            recent_input
-            and self._hid_suppressed_at > 0
-            and now - self._hid_suppressed_at <= SLEEP_REQUIRES_HID_IDLE_SECONDS
-        ):
-            recent_input = False
-            hid_confirm = True
-        if locked or recent_input:
-            if recent_input:
-                self._hid_suppressed_at = now
+        if locked:
             emit(
                 {
                     "component": "clapwake.detector",
                     "event": "sleep_suppressed",
-                    "reason": "screen_locked" if locked else "recent_hid_input",
+                    "reason": "screen_locked",
                     "gap_s": round(gap, 3),
                     "hid_idle_s": round(idle, 2),
-                    "required_idle_s": SLEEP_REQUIRES_HID_IDLE_SECONDS,
-                    "screen_locked": locked,
-                    "own_hid_s": round(now - self._own_hid_mono, 2)
-                    if self._own_hid_mono
-                    else None,
+                    "screen_locked": True,
                 },
                 stream=sys.stdout,
             )
             return
 
-        # Gate passed: only now cancel residual wake retries and act.
-        self._hid_suppressed_at = 0.0
         cancelled = self._bump_wake_generation()
         emit(
             {
@@ -880,7 +843,6 @@ class ClapDetector:
                 "gap_s": round(gap, 3),
                 "t0_mono": round(t0, 3),
                 "hid_idle_s": round(idle, 2),
-                "hid_confirm": hid_confirm,
                 "cancelled_wake_gen": cancelled,
             },
             stream=sys.stdout,
@@ -930,7 +892,6 @@ class ClapDetector:
 
             launched_at = time.monotonic()
             native = hybrid_wake_once()
-            self._own_hid_mono = launched_at
             # Every pulse: IOHID + BetterDisplay DDC. caffeinate only on pulse 0.
             commands: list[list[str]] = [WAKE_HID_CMD, WAKE_DDC_CMD]
             if pulse_i == 0:
