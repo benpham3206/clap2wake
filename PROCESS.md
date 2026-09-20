@@ -719,3 +719,38 @@ Not committed (left as local dirty tree for Ben).
 
 - Live round-trip: `sleep_verify` at_target (0.0, 0.0), `wake_verify`
   at_target (1.0, 100.0). 43 offline tests pass.
+
+---
+
+# Part 19: Second pair confirms HID-gated sleep (2026-09-20)
+
+## Verdict
+
+- 11:43:01 and 11:43:02 pairs were heard (`gap_s` 0.392 / 0.383) then
+  `sleep_suppressed` `recent_hid_input` (idle 1.2s / 2.35s). Hear was
+  live. Restarting the process would not have slept the panel.
+
+## What changed
+
+- First recent-HID pair still drops (password-typing incident).
+- A second pair inside the 3s idle window is intent: `sleep_triggered`
+  with `hid_confirm: true`.
+- Watchdog `com.you.clapwake.watchdog` remains the process restarter.
+  Do not kickstart on `sleep_suppressed`.
+
+---
+
+# Part 20: First desk pair must sleep (2026-09-20)
+
+## Verdict
+
+- 11:52:43 first pair was `sleep_suppressed` `recent_hid_input`
+  (idle 0.75s). 11:52:45 retry slept with `hid_confirm`. Later toggles
+  worked because wake F18 looked like "our" HID. The first clap of a
+  session had no such exemption.
+
+## What changed
+
+- Sleep no longer gates on HID idle. A clap pair on a lit panel sleeps.
+- Login window still suppresses. THRESH and the busy-room gate stay.
+- Removed `_hid_suppressed_at`, `_own_hid_mono`, and `hid_confirm`.
