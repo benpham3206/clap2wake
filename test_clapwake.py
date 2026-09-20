@@ -314,13 +314,14 @@ def run_sleep_gate(
     locked: bool,
     own_hid_age: float | None = None,
     levels: list[tuple[float, float]] | None = None,
+    det: clapwake.ClapDetector | None = None,
 ) -> list[str]:
     """Drive _sleep_if_user_absent with a faked HID idle time and lock state.
 
     levels scripts panel_levels() reads for the verify loop; default is one
     dark read so the loop verifies on its first pass and stays offline.
     """
-    det = clapwake.ClapDetector()
+    det = clapwake.ClapDetector() if det is None else det
     launched: list[str] = []
     det._launch_commands = (  # type: ignore[method-assign]
         lambda commands, action, t0, pulse: launched.append(action)
@@ -357,6 +358,36 @@ def test_sleep_blocked_while_typing() -> None:
     """18:51:06 — typing a password slept the display. Must not happen again."""
     idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
     check("recent keystroke -> sleep suppressed", run_sleep_gate(idle, False), [])
+
+
+def test_second_pair_confirms_hid_suppressed_sleep() -> None:
+    """11:43:01 then 11:43:02 — two heard pairs were dropped by recent_hid_input."""
+    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
+    det = clapwake.ClapDetector()
+    check(
+        "first pair while HID is hot -> suppressed",
+        run_sleep_gate(idle, False, det=det),
+        [],
+    )
+    check(
+        "immediate retry is intent, not a process restart",
+        run_sleep_gate(idle, False, det=det),
+        ["sleep"],
+    )
+
+
+def test_hid_confirm_expires_with_the_idle_window() -> None:
+    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
+    det = clapwake.ClapDetector()
+    run_sleep_gate(idle, False, det=det)
+    det._hid_suppressed_at = time.monotonic() - (
+        clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS + 0.1
+    )
+    check(
+        "stale suppress is not a confirm",
+        run_sleep_gate(idle, False, det=det),
+        [],
+    )
 
 
 def test_sleep_blocked_at_the_login_window() -> None:
@@ -708,6 +739,8 @@ def main() -> int:
         test_short_sleep_cooldown_allows_quick_rewake,
         test_gesture_band_constants_are_sane,
         test_sleep_blocked_while_typing,
+        test_second_pair_confirms_hid_suppressed_sleep,
+        test_hid_confirm_expires_with_the_idle_window,
         test_sleep_blocked_at_the_login_window,
         test_sleep_fires_when_the_desk_is_idle,
         test_sleep_is_ddc_luminance_zero_not_os_display_sleep,

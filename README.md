@@ -23,9 +23,10 @@ a new pair. There is no fast-for-wake or slow-for-sleep split.
 - Read-back checks log `sleep_verify` or `wake_verify`. A mismatch can trigger up
   to four extra brightness commands. Exhaustion logs an `*_unverified` error.
   The final extra command is not followed by another check.
-- Dimming requires an unlocked session and three seconds without recent human
-  keyboard or mouse input. The listener accounts for its own wake HID events.
-  A blocked action logs `sleep_suppressed`. Wake does not use this guard.
+- Dimming requires an unlocked session. A pair during recent keyboard or mouse
+  input logs `sleep_suppressed`. A second pair inside three seconds is treated
+  as intent and logs `sleep_triggered` with `hid_confirm`. The listener ignores
+  its own wake HID events. Wake does not use this guard.
 - Onset threshold is `0.35`; release level is `0.08`. Quiet rearming, echo
   rejection, and a busy-room gate reduce false triggers from tails and audio.
 - Capture stays pinned to the Scarlett by name. The listener retries missing

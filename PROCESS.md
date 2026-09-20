@@ -719,3 +719,21 @@ Not committed (left as local dirty tree for Ben).
 
 - Live round-trip: `sleep_verify` at_target (0.0, 0.0), `wake_verify`
   at_target (1.0, 100.0). 43 offline tests pass.
+
+---
+
+# Part 19: Second pair confirms HID-gated sleep (2026-09-20)
+
+## Verdict
+
+- 11:43:01 and 11:43:02 pairs were heard (`gap_s` 0.392 / 0.383) then
+  `sleep_suppressed` `recent_hid_input` (idle 1.2s / 2.35s). Hear was
+  live. Restarting the process would not have slept the panel.
+
+## What changed
+
+- First recent-HID pair still drops (password-typing incident).
+- A second pair inside the 3s idle window is intent: `sleep_triggered`
+  with `hid_confirm: true`.
+- Watchdog `com.you.clapwake.watchdog` remains the process restarter.
+  Do not kickstart on `sleep_suppressed`.
