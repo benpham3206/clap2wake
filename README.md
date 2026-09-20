@@ -1,74 +1,51 @@
 # clap2wake
 
-Clap a **fast** pair to wake your display. Clap a **slow** pair to sleep it.
+Clap or snap twice to toggle the monitor. Use the same gesture for both directions.
+The microphone must receive each sound above the configured onset threshold.
 
-A background listener watches a microphone and fires the OS action. Both
-gestures are two claps — the **tempo** of the pair is the intent, not the count.
+| Monitor state | Two claps/snaps do this |
+|---|---|
+| Lit | Set software brightness to 0 and DDC luminance to 0 |
+| Dim | Set software brightness to 1 and DDC luminance to 100 |
 
-## How it works
+The default gap between sounds is **0.12–1.20 seconds**, with a 5 ms boundary
+tolerance. Faster onsets are treated as echoes. An onset beyond the window starts
+a new pair. There is no fast-for-wake or slow-for-sleep split.
 
-- `clapwake.py` — the listener. Runs as a macOS LaunchAgent, listens on a
-  pinned mic device, and times the gap between a pair of claps.
-- **Tempo decides, and it decides on clap 2:**
+## Behavior and safeguards
 
-  | gap between the two claps | result |
-  |---|---|
-  | < 0.15 s | echo of clap 1 — ignored, still waiting for the real partner |
-  | **0.15 – 0.60 s** | **wake** |
-  | **0.60 – 1.20 s** | **sleep** |
-  | > 1.20 s | too late to pair; that clap starts a new pair |
+- BetterDisplay reads software brightness and DDC luminance from `LS32CG51x`.
+  Either channel near zero means dim. If both reads fail, the pair requests wake.
+- Dimming changes monitor brightness, not macOS display power. It does not call
+  `pmset displaysleepnow`, which can trigger clamshell sleep and locking.
+- Wake uses F18 HID events, IOPM activity, `caffeinate`, and BetterDisplay.
+  Sparse pulses at 0, 0.8, 2, and 4 seconds cover deep DisplayPort idle.
+- Read-back checks log `sleep_verify` or `wake_verify`. A mismatch can trigger up
+  to four extra brightness commands. Exhaustion logs an `*_unverified` error.
+  The final extra command is not followed by another check.
+- Dimming requires an unlocked session and three seconds without recent human
+  keyboard or mouse input. The listener accounts for its own wake HID events.
+  A blocked action logs `sleep_suppressed`. Wake does not use this guard.
+- Onset threshold is `0.35`; release level is `0.08`. Quiet rearming, echo
+  rejection, and a busy-room gate reduce false triggers from tails and audio.
+- Capture stays pinned to the Scarlett by name. The listener retries missing
+  devices, reconnects stalled streams, and requests process restarts for repeated
+  failures. Heartbeats report callback age, not just process existence.
 
-  One boundary at 0.60 s, measured from 17 real pairs: wake attempts ran
-  0.278–0.583 s, sleep attempts 0.650–1.021 s. The bands are **contiguous**, so
-  every pair resolves to an action — you never clap at a system that silently
-  ignores you. A gap sitting exactly on the boundary resolves to **wake**: a
-  stray wake is a lit screen you didn't ask for, a stray sleep is the screen
-  going black while you're using it, so the doubt lands on the harmless one.
+## Files
 
-- **Why tempo and not a 3-clap sleep.** Counting made "2 claps" a *prefix* of
-  "3 claps". A prefix code has to wait to learn which gesture it received, so
-  every spurious onset flipped wake→sleep and every missed onset flipped
-  sleep→wake. Widening the window to catch real triples is exactly what let
-  room echoes hijack doubles — the two failure modes rode one scalar and no
-  value of it fixed both. Tempo removes the prefix: intent is known the instant
-  clap 2 lands, nothing is deferred, and a third onset means nothing at all.
-- **No disambiguation delay.** Wake used to wait ~0.90 s for a possible 3rd
-  clap. It now fires on clap 2.
-- **Hybrid wake action:** IOHIDSystem F18 + BetterDisplay DDC
-  (`--hardwareBacklight=on` for `LS32CG51x`) + IOPM + `caffeinate -u` (pulse 0).
-  Retries at 0.8 / 2 / 4s re-fire HID and DDC for deep DPMS. F18 is inert on
-  the configured layout and does not type into applications.
-- Claps/snaps: onset **0.22** / re-arm **0.08** (hysteresis). Override the two
-  tempo bands with `CLAPWAKE_WAKE_MIN_GAP` / `CLAPWAKE_WAKE_MAX_GAP` and
-  `CLAPWAKE_SLEEP_MIN_GAP` / `CLAPWAKE_SLEEP_MAX_GAP`. The wake band must close
-  at or before the sleep band opens; the listener refuses to start otherwise,
-  so the two gestures can never overlap.
-  Continuous audio (recording) blocked by the busy-room gate.
-- Mic unplug / CoreAudio wedge is **self-healing** (open-config matrix, backoff,
-  clean process-boundary restart). Silence no longer causes stream churn.
-  Heartbeats in `/tmp/clapwake.out` report callback and signal age separately.
-- **Power boundary:** recording from the Scarlett keeps the listener alive but
-  does not prevent display idle. The LaunchAgent wrapper uses `caffeinate -s`
-  (system-sleep prevention), while macOS may still enter deep display sleep
-  after its `displaysleep` timeout. A 3-clap sleep is normally shallow and
-  wakes quickly; a long idle can require DisplayPort/monitor renegotiation.
-- **Sleep** remains `pmset displaysleepnow` (no BetterDisplay off path).
-- `scope.py` — a live terminal meter for tuning thresholds against your mic
-  and room. It pauses the background listener while running (both can't hold
-  the mic at once) and resumes it on exit.
-- `test_clapwake.py` — offline tests for the detector using a fake clock, no
-  real audio or launchd required.
-
-## Requirements
-
-- macOS
-- Python 3 with `sounddevice` and `numpy`
-- A dedicated input device (tested against a Focusrite Scarlett 2i2); pin it
-  by name via the `CLAPWAKE_MIC_NAME` env var
-- [BetterDisplay](https://github.com/waydabber/BetterDisplay) if your monitor
-  needs a DDC wake command in addition to `caffeinate`/`pmset`
+- `clapwake.py`: detection, brightness decisions, wake/dim actions, capture recovery.
+- `hostwatch.py`: power-source and microphone-index change detection.
+- `check_clapwake.py`: health report; `--repair` can bootstrap or restart the listener.
+- `scope.py`: microphone meter using the same detector with actions stubbed out.
+- `crd_wake.py`: wakes the monitor when a Chrome Remote Desktop session starts.
+- `hidwake.c`: the native F18 helper.
+- `PROCESS.md`: historical implementation notes, not the current gesture contract.
 
 ## Setup
+
+Requires macOS, Python, `numpy`, `sounddevice`, BetterDisplay, and a microphone
+available while the lid is closed. The configured device is a Scarlett 2i2.
 
 ```bash
 python3 -m venv .venv
@@ -78,45 +55,48 @@ clang -Wall -Wextra -Werror -Wno-deprecated-declarations \
   hidwake.c -o .venv/bin/clapwake-hid
 ```
 
-The HID helper uses Apple's IOHIDSystem post-event path. The first manual run
-may request Input Monitoring access:
+The helper and listener need the relevant macOS microphone, Accessibility, and
+Input Monitoring permissions. The monitor name and command paths are defined in
+`clapwake.py`.
 
-```bash
-.venv/bin/clapwake-hid
-```
+The listener runs as `com.you.clapwake`, using a user LaunchAgent that invokes
+`.venv/bin/python3 clapwake.py`. The local setup wraps it with `caffeinate -s`.
+The main listener plist is installed locally, not included in this repository.
 
-Load it as a LaunchAgent (see `PROCESS.md` for the full story of how this was
-built), pointing `ProgramArguments` at `.venv/bin/python3 clapwake.py`.
+The repository includes optional watchdog and Chrome Remote Desktop plists.
+Their paths are specific to this machine; adjust them before installing elsewhere.
+The watchdog runs `check_clapwake.py --repair` every 30 seconds when installed and
+loaded. It is not active merely because its plist exists. The local watchdog was
+not loaded when checked on 2026-09-20.
 
-## Tuning
+## Tuning and diagnostics
 
 ```bash
 .venv/bin/python3 scope.py
+.venv/bin/python3 check_clapwake.py
 ```
 
-Clap and watch the bar. `|` marks the onset threshold, `:` marks the release
-level. Every fire prints the **measured gap in ms** — that number is what you
-tune the bands against.
+Scope pauses the background listener and restores it on exit. It shows microphone
+peaks and detected pair gaps without changing monitor brightness. Measure claps,
+snaps, and desk noise before changing `THRESH`; quieter snaps may not cross it.
 
-Clap your natural fast pair ten times, then your natural slow pair ten times,
-and read the gaps back:
+LaunchAgent environment overrides:
 
-```bash
-grep -o '"gap_s": [0-9.]*' /tmp/clapwake.out | tail -20
-```
+- `CLAPWAKE_MIC_NAME`: preferred microphone name substring; default `Scarlett`.
+- `CLAPWAKE_WAKE_MIN_GAP` / `CLAPWAKE_WAKE_MAX_GAP`: the shared pair window.
+  Bounds must satisfy `0.12 <= min < max <= 1.50`.
+- `CLAPWAKE_SLEEP_HID_IDLE`: minimum human-input idle time; default `3.0` seconds.
 
-Put the boundary in the space between the two clusters. Move it by setting
-`CLAPWAKE_WAKE_MAX_GAP` and `CLAPWAKE_SLEEP_MIN_GAP` to the same value in the
-LaunchAgent environment. Values must satisfy
-`0.12 <= wake_min < wake_max <= sleep_min < sleep_max <= 1.50`.
-
-Setting `sleep_min` *above* `wake_max` turns the space between into a dead zone
-that fires nothing. That trades stray actions for silent misses — you clap and
-nothing happens — which is usually the worse of the two. Contiguous is the
-default for that reason.
+Logs are `/tmp/clapwake.out` and `/tmp/clapwake.err`. A trigger records a request;
+read-back records whether both brightness channels reached their target range.
+Some diagnostic field names retain the older wake/sleep-band terminology.
 
 ## Tests
 
 ```bash
 .venv/bin/python3 test_clapwake.py
+.venv/bin/python3 test_crd_wake.py
 ```
+
+These are offline tests with simulated peaks and stubbed actions. They do not
+replace a physical clap/snap test on the configured microphone and monitor.

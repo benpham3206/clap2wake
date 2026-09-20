@@ -5,20 +5,19 @@ Drives ClapDetector with an injected fake clock and stubbed action commands, so
 every gesture case is verified without real audio, real timers, or touching the
 display. Run:  ~/clapwake/.venv/bin/python3 ~/clapwake/test_clapwake.py
 
-Gesture model: a pair of claps. The TEMPO of the pair is the intent.
-  fast pair  -> wake      slow pair -> sleep      dead zone -> ignored
-There is no 3-clap gesture, so no gesture is a prefix of another and neither
-action waits on a disambiguation window.
+Gesture model: one pair window. Panel dark -> wake, lit -> dim.
 """
 
 from __future__ import annotations
+
+import time
 
 import clapwake
 
 
 class Recorder:
-    """Stands in for ClapDetector._run so we capture actions instead of firing
-    caffeinate/pmset/BetterDisplay for real."""
+    """Stands in for ClapDetector._run so we capture requests instead of firing
+    hardware commands for real."""
 
     def __init__(self) -> None:
         self.actions: list[tuple[str, int]] = []
@@ -29,10 +28,11 @@ class Recorder:
         self.gaps.append(gap)
 
 
-def make_detector() -> tuple[clapwake.ClapDetector, Recorder]:
+def make_detector(*, dark: bool = True) -> tuple[clapwake.ClapDetector, Recorder]:
     det = clapwake.ClapDetector()
     rec = Recorder()
     det._run = rec  # type: ignore[method-assign]
+    clapwake.panel_is_dark = lambda: dark  # type: ignore[assignment]
     return det, rec
 
 
@@ -41,8 +41,8 @@ QUIET = 0.0         # silence (< RELEASE) -> re-arms the hysteresis gate
 WAKE_MIN, WAKE_MAX = clapwake.WAKE_GAP_RANGE_SECONDS
 SLEEP_MIN, SLEEP_MAX = clapwake.SLEEP_GAP_RANGE_SECONDS
 REARM = clapwake.MIN_REARM_QUIET_SECONDS
-WAKE_GAP = (WAKE_MIN + WAKE_MAX) / 2.0     # a comfortable fast pair
-SLEEP_GAP = (SLEEP_MIN + SLEEP_MAX) / 2.0  # a comfortable slow pair
+WAKE_GAP = (WAKE_MIN + WAKE_MAX) / 2.0     # inside the shared pair window
+SLEEP_GAP = (SLEEP_MIN + SLEEP_MAX) / 2.0  # inside the shared pair window
 # (no default dead zone: the bands are contiguous)
 
 
@@ -86,15 +86,15 @@ def check(name: str, got, want) -> None:
 
 
 def test_fast_pair_wakes_immediately() -> None:
-    det, rec = make_detector()
+    det, rec = make_detector(dark=True)
     pair(det, 1.0, WAKE_GAP)
-    check("fast pair -> wake on clap 2", rec.actions, [("wake", 2)])
+    check("pair on a dark panel -> wake", rec.actions, [("wake", 2)])
 
 
 def test_slow_pair_sleeps_immediately() -> None:
-    det, rec = make_detector()
-    pair(det, 1.0, SLEEP_GAP)
-    check("slow pair -> sleep on clap 2", rec.actions, [("sleep", 2)])
+    det, rec = make_detector(dark=False)
+    pair(det, 1.0, WAKE_GAP)
+    check("same-speed pair on a lit panel -> sleep", rec.actions, [("sleep", 2)])
 
 
 def test_wake_needs_no_settle() -> None:
@@ -104,15 +104,25 @@ def test_wake_needs_no_settle() -> None:
     check("wake fired without any settle() call", rec.actions, [("wake", 2)])
 
 
+def test_wider_pair_window_toggles_both_states() -> None:
+    for gap in (0.12, 0.30, 0.70, 1.20):
+        for dark, action in ((True, "wake"), (False, "sleep")):
+            det, rec = make_detector(dark=dark)
+            pair(det, 1.0, gap)
+            check(f"gap {gap:.2f}s -> {action}", rec.actions, [(action, 2)])
+    det, rec = make_detector(dark=False)
+    pair(det, 1.0, 1.40)
+    check("1.40s is outside pair window", rec.actions, [])
+
+
 def test_gesture_boundaries_are_inclusive() -> None:
-    # The shared edge belongs to wake (see test_boundary_gap_resolves_to_wake),
-    # so the first sleep gap is a hair past it.
-    first_sleep = SLEEP_MIN + (0.01 if clapwake.BANDS_ARE_CONTIGUOUS else 0.0)
-    for gap, want in ((WAKE_MIN, "wake"), (WAKE_MAX, "wake"),
-                      (first_sleep, "sleep"), (SLEEP_MAX, "sleep")):
-        det, rec = make_detector()
+    for gap in (WAKE_MIN, WAKE_MAX):
+        det, rec = make_detector(dark=True)
         pair(det, 1.0, gap)
-        check(f"gap {gap:.2f}s -> {want}", rec.actions, [(want, 2)])
+        check(f"gap {gap:.2f}s dark -> wake", rec.actions, [("wake", 2)])
+        det, rec = make_detector(dark=False)
+        pair(det, 1.0, gap)
+        check(f"gap {gap:.2f}s lit -> sleep", rec.actions, [("sleep", 2)])
 
 
 # --- the regression that started this: a 3rd onset must not flip intent -----
@@ -129,56 +139,50 @@ def test_third_onset_cannot_convert_wake_into_sleep() -> None:
 
 def test_third_onset_cannot_convert_sleep_into_wake() -> None:
     """The mirror bug: a missed/extra onset used to turn a sleep into a wake."""
-    det, rec = make_detector()
-    last = pair(det, 1.0, SLEEP_GAP)
+    det, rec = make_detector(dark=False)
+    last = pair(det, 1.0, WAKE_GAP)
     clap(det, last + 0.30)
     check("phantom 3rd cannot wake after sleep", rec.actions, [("sleep", 2)])
 
 
 def test_no_gesture_is_a_prefix_of_another() -> None:
-    """Structural guarantee: the wake and sleep bands cannot overlap."""
-    check("wake band closes at or before sleep opens", WAKE_MAX <= SLEEP_MIN, True)
+    """Wake and sleep share one pair window; neither is a prefix of the other."""
+    check("sleep uses the wake pair window", SLEEP_MIN == WAKE_MIN, True)
+    check("sleep ends with the wake pair window", SLEEP_MAX == WAKE_MAX, True)
 
 
 def test_contiguous_bands_leave_no_gap_unanswered() -> None:
-    """Default config is contiguous: every legal pair resolves to an action."""
-    check("bands are contiguous", clapwake.BANDS_ARE_CONTIGUOUS, True)
-    gap = WAKE_MAX
-    while gap <= SLEEP_MAX - 0.01:
-        det, rec = make_detector()
+    """Every gap inside the pair window resolves to an action."""
+    gap = WAKE_MIN
+    while gap <= WAKE_MAX + 1e-9:
+        det, rec = make_detector(dark=True)
         pair(det, 1.0, gap)
         check(f"gap {gap:.2f}s resolves to an action", len(rec.actions), 1)
         gap += 0.05
 
 
 def test_boundary_gap_resolves_to_wake_not_sleep() -> None:
-    """Doubt at the shared edge must land on the harmless action."""
-    det, rec = make_detector()
+    """On a dark panel the pair-window edge still wakes."""
+    det, rec = make_detector(dark=True)
     pair(det, 1.0, WAKE_MAX)
-    check("gap exactly at the boundary -> wake", rec.actions, [("wake", 2)])
+    check("gap exactly at the pair ceiling -> wake", rec.actions, [("wake", 2)])
 
 
 def test_dead_zone_still_works_when_bands_are_separated() -> None:
-    """A configured gap between the bands must still discard the pair."""
-    saved = clapwake.SLEEP_GAP_RANGE_SECONDS, clapwake.BANDS_ARE_CONTIGUOUS
-    clapwake.SLEEP_GAP_RANGE_SECONDS = (WAKE_MAX + 0.20, SLEEP_MAX)
-    clapwake.BANDS_ARE_CONTIGUOUS = False
-    try:
-        det, rec = make_detector()
-        pair(det, 1.0, WAKE_MAX + 0.10)
-        check("separated bands -> pair discarded", rec.actions, [])
-    finally:
-        clapwake.SLEEP_GAP_RANGE_SECONDS, clapwake.BANDS_ARE_CONTIGUOUS = saved
+    """A gap past the pair window is not sleep; it starts a new pair."""
+    det, rec = make_detector(dark=False)
+    pair(det, 1.0, WAKE_MAX + 0.10)
+    check("past pair window -> no action", rec.actions, [])
 
 
 # --- rejection cases ---------------------------------------------------------
 
 
 def test_pair_past_sleep_max_is_not_a_gesture() -> None:
-    det, rec = make_detector()
-    pair(det, 1.0, SLEEP_MAX + 0.30)
-    det.settle(now=1.0 + SLEEP_MAX * 2 + 0.5)
-    check("pair slower than the sleep band -> no action", rec.actions, [])
+    det, rec = make_detector(dark=False)
+    pair(det, 1.0, WAKE_MAX + 0.30)
+    det.settle(now=1.0 + WAKE_MAX * 2 + 0.5)
+    check("pair slower than the pair window -> no action", rec.actions, [])
 
 
 def test_echo_faster_than_wake_min_is_ignored() -> None:
@@ -198,9 +202,9 @@ def test_echo_does_not_consume_the_real_second_clap() -> None:
 
 
 def test_onset_slower_than_sleep_max_starts_a_new_pair() -> None:
-    det, rec = make_detector()
+    det, rec = make_detector(dark=True)
     clap(det, 1.0)
-    late = 1.0 + SLEEP_MAX + 0.25      # too late to pair with clap 1
+    late = 1.0 + WAKE_MAX + 0.25      # too late to pair with clap 1
     clap(det, late)
     check("stale clap 1 abandoned, no action yet", rec.actions, [])
     clap(det, late + WAKE_GAP)         # pairs with the late clap instead
@@ -255,18 +259,20 @@ def test_singing_with_rearmable_dips_busy_gate_blocks() -> None:
 
 
 def test_post_wake_cooldown_blocks_phantom_gesture() -> None:
-    det, rec = make_detector()
+    det, rec = make_detector(dark=True)
     last = pair(det, 1.0, WAKE_GAP)
     t = last + 0.05
-    pair(det, t, SLEEP_GAP)   # a full slow pair inside the wake cooldown
+    clapwake.panel_is_dark = lambda: False  # type: ignore[assignment]
+    pair(det, t, WAKE_GAP)
     check("gesture inside wake cooldown ignored", rec.actions, [("wake", 2)])
 
 
 def test_sleep_works_after_wake_cooldown() -> None:
-    det, rec = make_detector()
+    det, rec = make_detector(dark=True)
     last = pair(det, 1.0, WAKE_GAP)
-    t = last + clapwake.WAKE_COOLDOWN_SECONDS + 0.05
-    pair(det, t, SLEEP_GAP)
+    t = last + clapwake.SLEEP_COOLDOWN_SECONDS + 0.05
+    clapwake.panel_is_dark = lambda: False  # type: ignore[assignment]
+    pair(det, t, WAKE_GAP)
     check(
         "real sleep after wake cooldown still fires",
         rec.actions,
@@ -275,10 +281,11 @@ def test_sleep_works_after_wake_cooldown() -> None:
 
 
 def test_short_sleep_cooldown_allows_quick_rewake() -> None:
-    det, rec = make_detector()
-    last = pair(det, 1.0, SLEEP_GAP)
+    det, rec = make_detector(dark=False)
+    last = pair(det, 1.0, WAKE_GAP)
     check("sleep fires", rec.actions, [("sleep", 2)])
     t = last + clapwake.SLEEP_COOLDOWN_SECONDS + 0.05
+    clapwake.panel_is_dark = lambda: True  # type: ignore[assignment]
     pair(det, t, WAKE_GAP)
     check(
         "wake soon after short sleep cooldown",
@@ -289,15 +296,216 @@ def test_short_sleep_cooldown_allows_quick_rewake() -> None:
 
 def test_gesture_band_constants_are_sane() -> None:
     assert WAKE_MIN >= 0.12          # below this it is an echo, not intent
-    assert WAKE_MAX <= 0.65          # a "fast" pair must still feel fast
-    assert SLEEP_MIN >= 0.55         # a "slow" pair must feel deliberate
-    assert SLEEP_MAX <= 1.50         # beyond this it is two separate claps
-    assert WAKE_MAX <= SLEEP_MIN
+    assert WAKE_MAX <= 1.50          # a pair must still feel like one gesture
+    check("wake and sleep share the pair window", SLEEP_MIN == WAKE_MIN, True)
+    check("wake and sleep share the pair ceiling", SLEEP_MAX == WAKE_MAX, True)
     check(
         "clapwake exposes both bands",
         (clapwake.WAKE_GAP_RANGE_SECONDS, clapwake.SLEEP_GAP_RANGE_SECONDS),
         ((WAKE_MIN, WAKE_MAX), (SLEEP_MIN, SLEEP_MAX)),
     )
+
+
+# --- sleep is gated on "is a human at the keyboard right now?" ---------------
+
+
+def run_sleep_gate(
+    idle: float,
+    locked: bool,
+    own_hid_age: float | None = None,
+    levels: list[tuple[float, float]] | None = None,
+) -> list[str]:
+    """Drive _sleep_if_user_absent with a faked HID idle time and lock state.
+
+    levels scripts panel_levels() reads for the verify loop; default is one
+    dark read so the loop verifies on its first pass and stays offline.
+    """
+    det = clapwake.ClapDetector()
+    launched: list[str] = []
+    det._launch_commands = (  # type: ignore[method-assign]
+        lambda commands, action, t0, pulse: launched.append(action)
+    )
+    if own_hid_age is not None:
+        det._own_hid_mono = time.monotonic() - own_hid_age
+    reads = list(levels) if levels is not None else [(0.0, 0.0)]
+    exhausted = reads[-1]
+    saved = (
+        clapwake.hid_idle_seconds,
+        clapwake.screen_is_locked,
+        clapwake.panel_levels,
+        clapwake.PANEL_VERIFY_DELAY_SECONDS,
+    )
+    clapwake.hid_idle_seconds = lambda: idle          # type: ignore[assignment]
+    clapwake.screen_is_locked = lambda: locked        # type: ignore[assignment]
+    clapwake.panel_levels = (                          # type: ignore[assignment]
+        lambda: reads.pop(0) if reads else exhausted
+    )
+    clapwake.PANEL_VERIFY_DELAY_SECONDS = 0.0
+    try:
+        det._sleep_if_user_absent(clapwake.SLEEP_COMMANDS, 0.0, 2, 0.7)
+    finally:
+        (
+            clapwake.hid_idle_seconds,
+            clapwake.screen_is_locked,
+            clapwake.panel_levels,
+            clapwake.PANEL_VERIFY_DELAY_SECONDS,
+        ) = saved
+    return launched
+
+
+def test_sleep_blocked_while_typing() -> None:
+    """18:51:06 — typing a password slept the display. Must not happen again."""
+    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS / 2.0
+    check("recent keystroke -> sleep suppressed", run_sleep_gate(idle, False), [])
+
+
+def test_sleep_blocked_at_the_login_window() -> None:
+    check("screen locked -> sleep suppressed", run_sleep_gate(60.0, True), [])
+
+
+def test_sleep_fires_when_the_desk_is_idle() -> None:
+    idle = clapwake.SLEEP_REQUIRES_HID_IDLE_SECONDS + 1.0
+    check("idle + unlocked -> sleep fires", run_sleep_gate(idle, False), ["sleep"])
+
+
+def test_sleep_is_ddc_luminance_zero_not_os_display_sleep() -> None:
+    """hardwareBacklight=off reports off on this Samsung while luminance stays 100."""
+    cmds = clapwake.SLEEP_COMMANDS
+    check("sleep is a single command", len(cmds), 1)
+    argv = cmds[0]
+    joined = " ".join(argv)
+    check("sleep uses BetterDisplay", argv[0], clapwake.BETTERDISPLAY_BIN)
+    check("sleep names the Samsung", f"--name={clapwake.DISPLAY_NAME}" in argv, True)
+    check("sleep zeros software brightness", "--brightness=0" in argv, True)
+    check("sleep is DDC luminance", "--ddc" in argv and "--vcp=luminance" in argv, True)
+    check("sleep sets luminance 0", "--value=0" in argv, True)
+    check("sleep is not pmset displaysleepnow", "displaysleepnow" in joined, False)
+    check("sleep is not the no-op hardwareBacklight flag", "--hardwareBacklight=off" in argv, False)
+    wake = clapwake.WAKE_DDC_CMD
+    check("wake restores brightness", "--brightness=1" in wake, True)
+    check("wake restores DDC luminance", "--vcp=luminance" in wake and "--value=100" in wake, True)
+
+
+def test_unknown_hid_idle_does_not_suppress() -> None:
+    """A failed query must not silently disable the sleep gesture forever."""
+    check("idle unreadable (-1) -> sleep still fires", run_sleep_gate(-1.0, False), ["sleep"])
+
+
+def test_sleep_after_own_wake_hid_still_fires() -> None:
+    """09:48:59 — sleep after a successful wake was dropped by clapwake-hid."""
+    check(
+        "own wake HID 1.27s ago is not a human at the keyboard",
+        run_sleep_gate(1.27, False, own_hid_age=1.27),
+        ["sleep"],
+    )
+
+
+def test_human_hid_after_own_wake_still_blocks() -> None:
+    check(
+        "a real key newer than our wake HID still suppresses",
+        run_sleep_gate(0.20, False, own_hid_age=1.50),
+        [],
+    )
+
+
+# --- actions are durable: re-fired until the panel reads back at target -----
+
+
+def test_sleep_retries_until_panel_reads_dark() -> None:
+    """A lit read-back retries dimming; a dark read-back stops the retry loop."""
+    launched = run_sleep_gate(
+        60.0, False, levels=[(1.0, 100.0), (0.0, 0.0)]
+    )
+    check("lit read-back re-fires the sleep set", launched, ["sleep", "sleep"])
+
+
+def test_sleep_gives_up_after_bounded_retries() -> None:
+    launched = run_sleep_gate(
+        60.0, False, levels=[(1.0, 100.0)] * clapwake.PANEL_VERIFY_ATTEMPTS
+    )
+    check(
+        "unreachable panel -> bounded refires, then unverified",
+        launched,
+        ["sleep"] * (1 + clapwake.PANEL_VERIFY_ATTEMPTS),
+    )
+
+
+def test_levels_are_dark_reads_either_channel() -> None:
+    """Luminance 0 with brightness stuck at 1 is still a dark panel."""
+    cases = [
+        ((1.0, 100.0), False),
+        ((0.0, 100.0), True),
+        ((1.0, 0.0), True),
+        ((None, None), True),     # unreadable -> wake bias
+        ((None, 100.0), False),   # one lit read is still lit
+        ((0.0, None), True),
+    ]
+    for (brightness, luminance), want in cases:
+        check(
+            f"levels ({brightness}, {luminance}) -> dark={want}",
+            clapwake.levels_are_dark(brightness, luminance),
+            want,
+        )
+
+
+def test_levels_at_target_needs_both_channels() -> None:
+    cases = [
+        ((0.0, 0.0), True, True),
+        ((0.0, 50.0), True, False),   # luminance not down yet
+        ((1.0, 100.0), False, True),
+        ((1.0, 50.0), False, False),
+        ((None, 0.0), True, False),   # unreadable -> not verified
+    ]
+    for (brightness, luminance), dark, want in cases:
+        check(
+            f"levels ({brightness}, {luminance}) dark={dark} -> {want}",
+            clapwake.levels_at_target(brightness, luminance, dark),
+            want,
+        )
+
+
+def test_wake_is_never_gated() -> None:
+    """A stray wake is a no-op; a stray sleep blacks the screen. Only gate sleep."""
+    import inspect
+
+    src = inspect.getsource(clapwake.ClapDetector._run)
+    gated = src.split('if action == "sleep":')[1]
+    check("only the sleep branch reaches the gate", "_sleep_if_user_absent" in gated, True)
+    check(
+        "wake branch does not consult the gate",
+        "_sleep_if_user_absent" in src.split('if action == "wake":')[1].split('if action == "sleep":')[0],
+        False,
+    )
+
+
+# --- the two wake paths must press the same key ------------------------------
+
+
+def test_wake_keycode_matches_hid_helper() -> None:
+    """clapwake.py and hidwake.c must post the SAME keycode.
+
+    They drifted once — Python posted 0x3F (kVK_Function) while the C helper
+    posted 79 (F18) — and the malformed synthetic Fn press made every wake ring
+    the system alert. Nothing else catches this: both paths "work", one beeps.
+    """
+    import pathlib
+    import re
+
+    src = (pathlib.Path(__file__).parent / "hidwake.c").read_text()
+    m = re.search(r"kWakeKeyCode\s*=\s*(\d+)", src)
+    check("hidwake.c declares a keycode", m is not None, True)
+    assert m is not None
+    check(
+        "clapwake.py and hidwake.c agree on the wake key",
+        (clapwake.WAKE_KEY_CODE, int(m.group(1))),
+        (79, 79),
+    )
+
+
+def test_wake_key_is_not_a_modifier() -> None:
+    """Modifier keycodes cannot be pressed discretely; synthesizing one beeps."""
+    modifiers = {0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x37, 0x38, 0x39, 0x3A}
+    check("wake key is not a modifier", clapwake.WAKE_KEY_CODE in modifiers, False)
 
 
 # --- stream plumbing (unchanged by the gesture rework) -----------------------
@@ -322,6 +530,56 @@ def test_stream_open_configs_include_fallbacks() -> None:
     check("has default latency", any("latency" not in c for c in mono), True)
 
 
+def test_portaudio_refresh_reveals_a_replugged_mic() -> None:
+    """A mic unplugged overnight must come back without a manual restart.
+
+    PortAudio caches its device enumeration at init, so query_devices() keeps
+    reporting the pinned mic as absent for the life of the process -- the
+    listener sits deaf with the Scarlett plugged in right there. Refreshing the
+    host API has to rebuild that list so the next select finds the device.
+    """
+
+    class FakeSd:
+        """PortAudio's cache: the visible list only changes on _initialize."""
+
+        def __init__(self) -> None:
+            self.attached = False   # what is physically on the USB bus
+            self.terminated = 0
+            self.initialized = 0
+            self._visible = self._enumerate()
+
+        def _enumerate(self) -> list[dict]:
+            devices = [{"name": "MacBook Pro Microphone", "max_input_channels": 1}]
+            if self.attached:
+                devices.insert(
+                    0, {"name": "Scarlett 2i2 USB", "max_input_channels": 2}
+                )
+            return devices
+
+        def query_devices(self) -> list[dict]:
+            return list(self._visible)
+
+        def _terminate(self) -> None:
+            self.terminated += 1
+
+        def _initialize(self) -> None:
+            self.initialized += 1
+            self._visible = self._enumerate()
+
+    sd = FakeSd()
+    check("absent while genuinely unplugged", clapwake.select_preferred_mic(sd), None)
+
+    sd.attached = True  # Ben plugs the Scarlett back in for the day.
+    check("stale cache still hides it", clapwake.select_preferred_mic(sd), None)
+
+    check("refresh reports success", clapwake.refresh_device_list(sd), True)
+    check("portaudio was rebuilt", (sd.terminated, sd.initialized), (1, 1))
+
+    found = clapwake.select_preferred_mic(sd)
+    check("scarlett is visible again", found is not None, True)
+    check("and it is the pinned device", found[1], "Scarlett 2i2 USB")
+
+
 def test_stream_restart_threshold_is_bounded() -> None:
     check(
         "native audio host gets a bounded process restart",
@@ -330,11 +588,105 @@ def test_stream_restart_threshold_is_bounded() -> None:
     )
 
 
+class _FakeNotify:
+    def __init__(self, fires: list[bool] | None = None) -> None:
+        self.fires = list(fires or [])
+
+    def check(self) -> bool:
+        if self.fires:
+            return bool(self.fires.pop(0))
+        return False
+
+
+def test_hostwatch_reconnects_on_unplug_and_index_churn() -> None:
+    import hostwatch
+
+    power = {"src": "AC Power"}
+    watch = hostwatch.HostWatch(
+        1,
+        power_source_fn=lambda: power["src"],
+        notify=_FakeNotify([False, True, False]),
+    )
+    scarlett = (1, "Scarlett 2i2 USB", 2)
+    check("steady host is a no-op", watch.poll(scarlett), None)
+    check("mic gone -> reconnect", watch.poll(None), "mic_absent")
+    check("index churn -> reconnect", watch.poll((0, "Scarlett 2i2 USB", 2)), "device_index_changed")
+    power["src"] = "Battery Power"
+    check(
+        "AC unplug -> process restart reason",
+        watch.poll(scarlett),
+        "power_source_changed",
+    )
+    check("same battery after flip is quiet", watch.poll(scarlett), None)
+
+
+def test_repair_action_starts_and_kicks_a_dead_listener() -> None:
+    import check_clapwake as chk
+
+    now = 1_800_000_000.0
+
+    def ev(ts_off: float, event: str, **extra):
+        t = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now + ts_off))
+        return {"ts": t, "event": event, **extra}
+
+    check(
+        "unloaded agent -> bootstrap (mic may appear later)",
+        chk.repair_action(loaded=False, pid=None, now=now, events=[]),
+        "bootstrap",
+    )
+    check(
+        "loaded but no pid -> kickstart",
+        chk.repair_action(loaded=True, pid=None, now=now, events=[]),
+        "kickstart",
+    )
+    check(
+        "fresh start is left alone until the first heartbeat",
+        chk.repair_action(
+            loaded=True,
+            pid=9,
+            now=now,
+            events=[ev(-10, "service_start"), ev(-10, "listening")],
+        ),
+        None,
+    )
+    check(
+        "no heartbeat past grace -> kickstart",
+        chk.repair_action(
+            loaded=True,
+            pid=9,
+            now=now,
+            events=[ev(-120, "service_start"), ev(-120, "listening")],
+        ),
+        "kickstart",
+    )
+    check(
+        "fresh heartbeat with live callbacks -> none",
+        chk.repair_action(
+            loaded=True,
+            pid=9,
+            now=now,
+            events=[
+                ev(-200, "service_start"),
+                ev(-5, "listening_heartbeat", secs_since_callback=0.01),
+            ],
+        ),
+        None,
+    )
+    loop = [ev(-200, "service_start")]
+    loop += [ev(-30 + i, "service_restart_requested") for i in range(5)]
+    check(
+        "already in a restart loop -> do not pile kickstarts",
+        chk.repair_action(loaded=True, pid=9, now=now, events=loop),
+        None,
+    )
+
+
 def main() -> int:
     tests = [
         test_fast_pair_wakes_immediately,
         test_slow_pair_sleeps_immediately,
         test_wake_needs_no_settle,
+        test_wider_pair_window_toggles_both_states,
         test_gesture_boundaries_are_inclusive,
         test_third_onset_cannot_convert_wake_into_sleep,
         test_third_onset_cannot_convert_sleep_into_wake,
@@ -355,9 +707,26 @@ def main() -> int:
         test_sleep_works_after_wake_cooldown,
         test_short_sleep_cooldown_allows_quick_rewake,
         test_gesture_band_constants_are_sane,
+        test_sleep_blocked_while_typing,
+        test_sleep_blocked_at_the_login_window,
+        test_sleep_fires_when_the_desk_is_idle,
+        test_sleep_is_ddc_luminance_zero_not_os_display_sleep,
+        test_unknown_hid_idle_does_not_suppress,
+        test_sleep_after_own_wake_hid_still_fires,
+        test_human_hid_after_own_wake_still_blocks,
+        test_sleep_retries_until_panel_reads_dark,
+        test_sleep_gives_up_after_bounded_retries,
+        test_levels_are_dark_reads_either_channel,
+        test_levels_at_target_needs_both_channels,
+        test_wake_is_never_gated,
+        test_wake_keycode_matches_hid_helper,
+        test_wake_key_is_not_a_modifier,
         test_reconnect_backoff_grows_and_caps,
         test_stream_open_configs_include_fallbacks,
+        test_portaudio_refresh_reveals_a_replugged_mic,
         test_stream_restart_threshold_is_bounded,
+        test_hostwatch_reconnects_on_unplug_and_index_churn,
+        test_repair_action_starts_and_kicks_a_dead_listener,
     ]
     for t in tests:
         t()

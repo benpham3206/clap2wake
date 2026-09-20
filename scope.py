@@ -11,9 +11,7 @@ the LaunchAgent uses (`/tmp/clapwake.out`) with source=scope, so you can:
 
     tail -f /tmp/clapwake.out
 
-Gestures are tempo pairs: a fast pair wakes, a slow pair sleeps, and a pair
-landing between the bands is ignored. Every fire prints the measured gap in ms,
-which is what you tune the bands against.
+Clap or snap twice within the shared pair window. Panel brightness chooses the displayed action. Each detected pair prints its measured gap.
 
 On exit, scope always re-bootstraps com.you.clapwake (not only if pause
 succeeded). Leaving the LaunchAgent unloaded is what made the sleep gesture
@@ -102,7 +100,7 @@ def ensure_listener() -> bool:
 
     Always run on scope exit — not only when we successfully paused — so a
     crashed/killed scope session cannot leave clapwake unloaded (the failure
-    mode where triple-clap sleep 'stops working').
+    mode where clap-pair sleep 'stops working').
     """
     if _listener_loaded():
         print(f"background listener already running ({LISTENER_LABEL})")

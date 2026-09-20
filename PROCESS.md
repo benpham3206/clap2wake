@@ -388,7 +388,11 @@ Not committed (left as local dirty tree for Ben).
 
 - The Scarlett is continuously listened to while idle, but that only keeps the
   listener alive. The LaunchAgent's `caffeinate -s` prevents system sleep, not
-  display idle; `pmset` still has `displaysleep 5`.
+  display idle.
+- **2026-08-13:** `displaysleep 5` was blanking the Samsung during ordinary
+  desk use. AC is now `displaysleep 0` (Never); battery is 15 min. Clap sleep
+  is still `pmset displaysleepnow`. Restore `pmset -c displaysleep 5` only when
+  you need a deep-DPMS wake test.
 - A recent 3-clap sleep followed by wake is fast because the monitor/link is
   shallow. A long macOS idle allows deeper Samsung/DisplayPort DPMS, so wake
   latency is link renegotiation after clapwake has already triggered.
@@ -422,3 +426,296 @@ Not committed (left as local dirty tree for Ben).
 - Restored ordinary display sleep (`pmset displaysleepnow`). Backlight-only
   blanking and a permanent display-sleep assertion are explicitly not part of
   this fix.
+
+---
+
+# Part 9: Afternoon deafness after sleep clap (2026-08-28)
+
+## Verdict
+
+- Clapwake did not fire from 13:28 to 16:05 because the Scarlett stream stopped
+  delivering input callbacks. The detector was not the failure. The LaunchAgent
+  stayed up and self-heal spun for 2.6 h without recovering.
+
+## Timeline (all local, 2026-08-28)
+
+- Boot 08:49. `/tmp/clapwake.out` starts 08:50:46. No 08-27 log on this boot.
+- 08:50–13:27 healthy: 277 heartbeats, `secs_since_callback` ≈ 0.00x.
+- 10:18:20 `sleep_triggered` (gap 0.679 s) then 10:18:22 `wake_triggered`
+  (gap 0.453 s). Display off/on in 1 s. This path still works.
+- 13:27:15 `sleep_triggered` (gap 0.775 s). Display off. Heartbeat at 13:27:50
+  still live (`uptime_s` 16623.9).
+- 13:27:56 display on with no `wake_triggered` — HID keyboard, not clapwake.
+- 13:28:05 / 13:28:11 `sleep_suppressed` (`screen_locked`, gaps 0.923 / 1.097 s).
+  Those claps were heard. They were slow pairs, so they resolved to sleep and
+  the lock gate dropped them.
+- 13:28:15 display off again. `coreaudiod` turned off the Scarlett USB-audio
+  prevent-sleep assertion in the same second.
+- 13:28:20–21 first `audio_stream_dead` / `stopped reason=dead_or_signal`.
+- 13:28–16:05 restart loop: 284 `service_restart_requested`, 852 listen/stop
+  pairs, 283 PortAudio `PaMacCore (AUHAL) err='35'` (EAGAIN), 2× `err='-50'`.
+  Zero `wake_triggered` in that window.
+- 16:05:07 `DarkWake to FullWake from Deep Idle` from HID. Device index
+  moved 0→1 at 16:04:57.
+- 16:05:17 process 29728 `listening` on Scarlett index 1. Heartbeats at
+  16:06:17 and 16:07:17 with `secs_since_callback=0.001`. Recovered.
+
+## Writer of the stall
+
+- `coreaudiod` dropped the live Scarlett USB engine on the second display-off
+  (`TurnedOff` then `Released` the AppleUSBAudioEngine assertions at 13:28:15
+  and 13:28:51). PortAudio still opened a stream on a named device, then got
+  no callbacks for 5 s, then AUHAL `err=35` on reopen.
+- Chrome WebRTC released the Scarlett at 13:20:29, seven minutes earlier. It
+  is not the immediate trigger. Display sleep alone is also not sufficient:
+  the 13:27:15 sleep left callbacks alive.
+- The 13:27:56 on → 13:28:15 off bounce, with the login window up, is the
+  closest event to the HAL wedge. Keyboard HID later turned the panel on
+  (14:55–16:04) without unwedging audio. Only the 16:05 FullWake / device
+  re-enum restored callbacks.
+
+## Check-script blind spot
+
+- `check_clapwake.py` reports `NOMINAL` if the last stdout event is
+  `listening`. During the stall that was true for ~5 s of every 10 s cycle.
+  A live diagnosis needs a `listening_heartbeat` with `secs_since_callback < 2`.
+
+## Not a code change this session
+
+- Debug only. Listener is healthy again as of 16:05:17. Clap a fast pair to
+  confirm fire. If the 13:28 pattern repeats, the next move is to treat
+  `audio_callbacks_stalled` after display-off as a CoreAudio host wedge, not
+  a mic-absent poll, and to stop calling `NOMINAL` without a fresh heartbeat.
+
+---
+
+# Part 10: Stay up on unplug, start on mic, restart when down (2026-08-28)
+
+## Why
+
+- Ben unplugged AC and clap-to-sleep did nothing. Yesterday's 2.6 h stall was
+  the same class of failure: CoreAudio kept a named Scarlett but stopped
+  callbacks, `check_clapwake` still said NOMINAL, and KeepAlive restarted a
+  wedged host instead of waiting for a real host change.
+
+## What changed
+
+- `hostwatch.py`: every 2s the listen loop checks Scarlett index and AC vs
+  battery. Mic gone or index churn reconnects in-process. AC unplug/replug
+  exits 75 so launchd restarts PortAudio at a process boundary.
+- `check_clapwake.py --repair`: bootstrap if unloaded, kickstart if loaded
+  with no PID or with no `listening_heartbeat` past 75s. A live restart loop
+  is left alone. NOMINAL now requires a heartbeat with
+  `secs_since_callback < 2`.
+- LaunchAgent `com.you.clapwake.watchdog` runs `--repair` every 30s. That is
+  the "sleeper is off → start when the Scarlett is back / when the job died"
+  path. The listener already waited 15s in-process for a missing mic; the
+  watchdog covers the case where the job itself is gone.
+
+## Not changed
+
+- Tempo bands, sleep HID/lock gates, Scarlett name-pin, `caffeinate -s`
+  wrapper. On battery that wrapper still prevents idle system sleep so the
+  listener can hear a clap with the lid closed and an external panel.
+
+---
+
+# Part 11: Chrome Remote Desktop session wake (2026-08-31)
+
+## Why
+
+- 2026-08-24 diagnosed the black Samsung on Chrome Remote Desktop: the host
+  takes `NoDisplaySleepAssertion` named `Remoting session is active` and
+  posts HID, so macOS thinks the display is on, while the LS32CG51x stays in
+  DPMS until clapwake's DDC poke. That session fired HID+DDC+caffeinate once
+  (all rc 0) and left "wire CRD-connect → clapwake" as an open yes. Nothing
+  persisted, so remote login still left the panel black.
+
+## What changed
+
+- Session start is the rising edge of `Remoting session is active`, not the
+  presence of `remoting_me2me_host` (that process stays up whenever remote
+  access is enabled).
+- `crd_wake.py` polls `pmset -g assertions` every 1s and calls
+  `clapwake.fire_hybrid_wake` on that edge. Same pulse train as a fast clap.
+- LaunchAgent `com.you.clapwake.crd` keeps the watcher alive. Logs go to
+  `/tmp/clapwake.out` as `clapwake.crd` events.
+
+## Not changed
+
+- Clap hear/classify, sleep gates, `pmset displaysleep`, the clap LaunchAgent,
+  the watchdog. No new wake channel.
+
+---
+
+# Part 12: Clamshell lock loop when the panel goes dark (2026-09-20)
+
+## Verdict
+
+- The lock screen is not clapwake classify/fire. Lid closed + the last
+  display turning off enters `Clamshell Sleep`. `sysadminctl` screenLock
+  delay is immediate, so that DarkWake is a login window. Remote for Mac
+  HID then FullWakes into the lock screen and the 10s WindowServer DMGrace
+  expires back into Clamshell Sleep.
+
+## Evidence (this boot, 2026-09-19 21:37)
+
+- `AppleClamshellState = Yes`. AC `displaysleep 0`, `sleep 0`, clapwake
+  wrapped in `caffeinate -s`. None of that blocks clamshell when macOS
+  sees no awake display.
+- `pmset -g log`: six Clamshell Sleep entries in 2.5 min (01:16:47,
+  01:16:57, 01:17:07, 01:17:42, 01:18:12, 01:19:04). Each is followed by
+  `Display is turned off`, then HID FullWake from `Remote for Mac`, then
+  `loginwindow` User Activity.
+- Clapwake log this boot: zero `sleep_triggered`. Sleep path was not the
+  writer tonight.
+- 01:11:48 Scarlett stream died; 01:11:56 `preferred_mic_absent`. The
+  Samsung is gone from Quartz; the only display is BetterDisplay
+  `Generic Display` 1920x1080 (`unkn`/`vnon`). That is the USB-hub-drop
+  signature of a powered-off or DPMS-unlinked LS32CG51x, not DDC
+  backlight-off.
+
+## Writer
+
+- macOS clamshell policy: lid shut and no awake display → DarkWake
+  `Clamshell Sleep`. Immediate lock policy then presents loginwindow on
+  the next FullWake. Remote HID is the repeat, not a second bug.
+
+## Desired state (named, not built this pass)
+
+- OS display stays on. Samsung backlight is DDC `hardwareBacklight=off`.
+  DisplayPort link and the monitor USB hub stay up. Session stays
+  unlocked so Remote for Mac / CRD keep the live session.
+- `pmset displaysleepnow`, the monitor power button, and
+  `hardwarePowerOff` are the opposite of that state: they drop the
+  display, trip clamshell, and lock.
+
+## Not changed
+
+- Tempo bands, `SLEEP_COMMANDS` (`pmset displaysleepnow`), screenLock
+  delay, AC `displaysleep 0`. Changing sleep-to-DDC or screenLock is a
+  Ben yes: the first stops clap-sleep from locking; the second is a
+  security door.
+
+---
+
+# Part 13: Sleep is DDC backlight off (2026-09-20)
+
+## Why
+
+- Part 12 named the lock loop: lid closed + OS display off → Clamshell
+  Sleep → immediate screenLock. Ben picked option 1: clap-sleep must
+  darken the Samsung without putting the OS display to sleep.
+
+## What changed
+
+- `SLEEP_COMMANDS` is BetterDisplay `--hardwareBacklight=off` for
+  `LS32CG51x`, the inverse of the existing wake DDC command.
+- Offline test `test_sleep_is_ddc_backlight_off_not_os_display_sleep`
+  locks that argv. README sleep bullet matches.
+
+## Not changed
+
+- Tempo bands, sleep HID/lock gates, wake pulse train, screenLock delay,
+  AC `displaysleep 0`. No `pmset displaysleepnow` on the sleep path.
+
+---
+
+# Part 14: Sleep DDC is luminance 0 (2026-09-20)
+
+## Verdict
+
+- Hear and classify worked. 09:34:11 and 09:35:29 `sleep_triggered`.
+  Fire used `--hardwareBacklight=off`, which this Samsung reports as
+  `off` while DDC luminance stays 100 and the panel stays lit.
+
+## What changed
+
+- Sleep is `--ddc --vcp=luminance --value=0`. Wake DDC restores
+  `--value=100`. Still no `displaysleepnow`.
+
+## Evidence
+
+- `get -hardwareBacklight` → `off` while `get -ddc -vcp=luminance` →
+  `100` and `-brightness` → `1.0`. Direct set of luminance 0/100 and
+  brightness 0/1 both round-tripped.
+
+---
+
+# Part 15: Slow pair was the HID gate (2026-09-20)
+
+## Verdict
+
+- 09:42:23 slow pair (gap 0.966s) classified as sleep and was dropped:
+  `sleep_suppressed` `recent_hid_input` `hid_idle_s=1.87`. Writer is the
+  Aula 2.4G dongle (`AppleHIDKeyboardEventDriver product:2.4G Dongle`).
+  Luminance-0 sleep from part 14 never ran on that attempt.
+
+## What changed
+
+- Sleep/wake DDC now also set `--brightness=0` / `--brightness=1`.
+  HID idle gate stays 3.0s — lowering it reopens typing-as-sleep when
+  the audio thump beats WindowServer HID.
+
+---
+
+# Part 16: Sleep after wake was our own HID (2026-09-20)
+
+## Verdict
+
+- 09:48:52 sleep and 09:48:56 wake worked. 09:48:59 and 09:49:03 slow
+  pairs (0.905 / 1.088 s) were `sleep_suppressed` `recent_hid_input`
+  because the wake train posts F18 at 0 / 0.8 / 2 / 4 s. That is
+  clapwake, not Ben typing.
+
+## What changed
+
+- Sleep gate ignores HID explained by `_own_hid_mono` (wake pulses).
+  A real key newer than our post still suppresses.
+- Sleep/wake boundary 0.60 → 0.50. Live wake 0.479 stays wake.
+
+---
+
+# Part 17: Same clap speed, toggle on brightness (2026-09-20)
+
+## Why
+
+- Ben asked for the slow pair at the same speed as wake. Two intents
+  cannot share one tempo, so sleep is no longer a slower gap. A pair
+  in 0.15–0.50 s wakes if BetterDisplay brightness is ~0, else sleeps.
+
+## What changed
+
+- `SLEEP_GAP_RANGE_SECONDS` aliases the wake pair window.
+- `_dispatch_pair` reads `panel_is_dark()` off the audio callback.
+  Unknown brightness fails toward wake.
+
+---
+
+# Part 18: Actions verify and re-fire until the panel lands (2026-09-20)
+
+## Why
+
+- 09:36 — BetterDisplay returned `Failed.` on all 4 wake pulses; nothing
+  retried, so the DDC restore to 100 never ran that round.
+- 10:02 — three `sleep_triggered` in a row. Correction: those logs predate
+  the toggle implementation — that was the old tempo-based version logging
+  repeated sleeps. The logs carry no brightness read-back, so a delayed
+  set landing is unproven, not established.
+
+## What changed
+
+- `panel_levels()` reads both channels: software brightness and DDC
+  luminance. `panel_is_dark()` is dark if EITHER channel is dark; both
+  unreadable still fails toward wake.
+- Every action now runs `_verify_panel`: wait 0.7s, read back both
+  channels, re-fire the set while not at target (max 4 refires), emit
+  `{action}_verify` per check and `{action}_unverified` on exhaustion.
+  Generation-cancellable: a newer gesture kills a pending verify.
+- Wake keeps its fixed HID pulse train for deep DPMS; the verify loop runs
+  after it, re-firing DDC only.
+
+## Evidence
+
+- Live round-trip: `sleep_verify` at_target (0.0, 0.0), `wake_verify`
+  at_target (1.0, 100.0). 43 offline tests pass.

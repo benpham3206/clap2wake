@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 LABEL = "com.you.clapwake"
@@ -28,6 +29,12 @@ LOG_ERR = Path("/tmp/clapwake.err")
 
 LOG_STALE_SECONDS = 6 * 3600
 RECENT_LINES = 120
+# Heartbeat is every 60s. A process up longer than grace with no beat is dead.
+HEARTBEAT_STALE_SECONDS = 90.0
+STARTUP_GRACE_SECONDS = 75.0
+RESTART_LOOP_WINDOW_SECONDS = 120.0
+RESTART_LOOP_MAX = 4
+TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 # Failures that mean the service is not healthy right now.
 HARD_FAILURES = {
@@ -42,6 +49,136 @@ HARD_FAILURES = {
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def parse_ts(ts: object) -> float | None:
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.strptime(ts, TS_FORMAT).timestamp()
+    except ValueError:
+        return None
+
+
+def heartbeat_age_s(events: list[dict], now: float) -> float | None:
+    for ev in reversed(events):
+        if ev.get("event") == "listening_heartbeat":
+            t = parse_ts(ev.get("ts"))
+            if t is None:
+                return None
+            return now - t
+    return None
+
+
+def since_start_s(events: list[dict], now: float) -> float | None:
+    for ev in reversed(events):
+        if ev.get("event") == "service_start":
+            t = parse_ts(ev.get("ts"))
+            if t is None:
+                return None
+            return now - t
+    return None
+
+
+def restart_count(events: list[dict], now: float, window_s: float) -> int:
+    n = 0
+    for ev in reversed(events):
+        t = parse_ts(ev.get("ts"))
+        if t is None:
+            continue
+        if now - t > window_s:
+            break
+        if ev.get("event") == "service_restart_requested":
+            n += 1
+    return n
+
+
+def last_heartbeat_callback_age(events: list[dict]) -> float | None:
+    for ev in reversed(events):
+        if ev.get("event") == "listening_heartbeat":
+            cb = ev.get("secs_since_callback")
+            if isinstance(cb, (int, float)):
+                return float(cb)
+            return None
+    return None
+
+
+def repair_action(
+    *,
+    loaded: bool,
+    pid: int | None,
+    now: float,
+    events: list[dict],
+    heartbeat_stale_s: float = HEARTBEAT_STALE_SECONDS,
+    startup_grace_s: float = STARTUP_GRACE_SECONDS,
+    restart_loop_max: int = RESTART_LOOP_MAX,
+    restart_loop_window_s: float = RESTART_LOOP_WINDOW_SECONDS,
+) -> str | None:
+    """Return 'bootstrap', 'kickstart', or None if the listener is fine.
+
+    A live restart loop is already KeepAlive's job — do not pile kickstarts
+    on top of it. A hung process with no heartbeat is.
+    """
+    if not loaded:
+        return "bootstrap"
+    if not pid:
+        return "kickstart"
+    started = since_start_s(events, now)
+    if started is not None and started < startup_grace_s:
+        return None
+    if restart_count(events, now, restart_loop_window_s) >= restart_loop_max:
+        return None
+    hb_age = heartbeat_age_s(events, now)
+    if hb_age is None or hb_age > heartbeat_stale_s:
+        return "kickstart"
+    cb_age = last_heartbeat_callback_age(events)
+    if cb_age is not None and cb_age > 2.0:
+        return "kickstart"
+    if events and events[-1].get("event") == "stopped":
+        return "kickstart"
+    return None
+
+
+def gui_target() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def bootstrap_agent() -> tuple[bool, str]:
+    pr = run(["launchctl", "bootstrap", gui_target(), str(PLIST)])
+    err = ((pr.stderr or "") + (pr.stdout or "")).strip()
+    if pr.returncode == 0:
+        return True, "bootstrapped"
+    if "already" in err.lower():
+        return True, "already loaded"
+    return False, err or f"bootstrap exit {pr.returncode}"
+
+
+def kickstart_agent(*, kill: bool) -> tuple[bool, str]:
+    args = ["launchctl", "kickstart"]
+    if kill:
+        args.append("-k")
+    args.append(f"{gui_target()}/{LABEL}")
+    pr = run(args)
+    err = ((pr.stderr or "") + (pr.stdout or "")).strip()
+    if pr.returncode == 0:
+        return True, "kickstart -k" if kill else "kickstart"
+    return False, err or f"kickstart exit {pr.returncode}"
+
+
+def apply_repair(action: str, pid: int | None) -> tuple[bool, str]:
+    if action == "bootstrap":
+        ok, msg = bootstrap_agent()
+        if not ok:
+            return False, msg
+        kicked, kmsg = kickstart_agent(kill=False)
+        return kicked or ok, f"{msg}; {kmsg}"
+    if action == "kickstart":
+        if not agent_loaded():
+            ok, msg = bootstrap_agent()
+            if not ok:
+                return False, msg
+        return kickstart_agent(kill=bool(pid))
+    return False, f"unknown repair {action!r}"
 
 
 def load_json_lines(path: Path, limit: int = RECENT_LINES) -> list[dict]:
@@ -211,6 +348,26 @@ def main() -> int:
         if events and events[-1].get("event") == "stopped":
             problems.append("log ends on stopped (not currently listening)")
 
+        now = time.time()
+        started_s = since_start_s(events, now)
+        hb_age = heartbeat_age_s(events, now)
+        if pid and (started_s is None or started_s >= STARTUP_GRACE_SECONDS):
+            if hb_age is None:
+                problems.append(
+                    "no listening_heartbeat (need secs_since_callback < 2)"
+                )
+            elif hb_age > HEARTBEAT_STALE_SECONDS:
+                problems.append(f"heartbeat stale ({hb_age:.0f}s)")
+            else:
+                cb_age = last_heartbeat_callback_age(events)
+                notes.append(f"heartbeat_age={hb_age:.0f}s")
+                if cb_age is not None:
+                    notes.append(f"secs_since_callback={cb_age:.3f}")
+                    if cb_age > 2.0:
+                        problems.append(
+                            f"heartbeat callback stall ({cb_age:.1f}s)"
+                        )
+
         recent_hard = [
             str(e.get("failure_type"))
             for e in after
@@ -287,17 +444,47 @@ def main() -> int:
             else:
                 problems.append("Scarlett input not present in device list")
 
+    repair = "--repair" in sys.argv
+    action = repair_action(
+        loaded=agent_loaded(),
+        pid=pid,
+        now=time.time(),
+        events=events,
+    )
+    if repair and action:
+        ok, msg = apply_repair(action, pid)
+        print(
+            json.dumps(
+                {
+                    "component": "clapwake.watchdog",
+                    "event": "repair",
+                    "action": action,
+                    "ok": ok,
+                    "detail": msg,
+                    "problems": problems,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 0 if ok else 1
+
     if problems:
         print("CLAPWAKE NOT NOMINAL")
         for p in problems:
             print(f"  - {p}")
         if notes:
             print("  notes: " + "; ".join(notes))
+        if action:
+            print(f"  repair: {action} (run check_clapwake.py --repair)")
         print(
-            f"  fix: launchctl kickstart -k gui/$(id -u)/{LABEL}\n"
-            f"       # or: launchctl bootstrap gui/$(id -u) {PLIST}"
+            f"  fix: launchctl kickstart -k gui/{os.getuid()}/{LABEL}\n"
+            f"       # or: launchctl bootstrap gui/{os.getuid()} {PLIST}"
         )
         return 1
+
+    if repair:
+        return 0
 
     print("CLAPWAKE NOMINAL")
     print("  " + "; ".join(notes))

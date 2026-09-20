@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Double-clap listener that wakes the display with caffeinate."""
+"""Toggle a monitor with a clap pair and verify its brightness through BetterDisplay."""
 
 from __future__ import annotations
 
@@ -21,67 +21,37 @@ from ctypes import (
 )
 from typing import Any
 
-# Onset / hysteresis (finger snaps are quieter than hand claps; keep a wide
-# quiet floor so tails cannot re-arm into a phantom 3rd → sleep).
-THRESH = 0.22                # onset level (was 0.35; snaps often sit ~0.2–0.5)
+import hostwatch
+
+# Keep the onset threshold above desk noise and the release level below clap tails.
+# Quieter snaps may need microphone gain adjustment; measure with scope.py first.
+THRESH = 0.35                # onset level: a clap must peak at least this loud
 RELEASE = 0.08               # re-arm only after a real quiet (must stay << THRESH)
-# Gesture = a PAIR of claps; the TEMPO of the pair is the intent.
-#
-#   fast pair  -> wake      slow pair -> sleep      between -> ignored
-#
-# Why tempo and not count: counting made "2 claps" a prefix of "3 claps". A
-# prefix code must wait to learn which gesture it got, so every spurious onset
-# flipped wake→sleep and every missed onset flipped sleep→wake. Those were the
-# two bugs (Jul 21 triples-became-wakes, Jul 23 doubles-became-sleeps) — one
-# fault wearing two hats, and unfixable by tuning: widening the window to catch
-# real triples is exactly what let echoes hijack doubles. Tempo removes the
-# prefix. Both gestures are 2 claps, so intent is known the instant clap 2
-# lands: no disambiguation wait, and a 3rd onset means nothing at all.
-#
-# Bands measured from Ben's own claps, 2026-07-23 (17 pairs, /tmp/clapwake.out):
-#   wake attempts   0.278 0.278 0.313 0.366 0.371 0.371 0.372 …
-#                   0.479 0.488 0.531 0.583   <- the same intent, relaxed
-#   sleep attempts  0.650 0.650 0.651 0.743 0.743 1.021
-# The natural split is 0.583 → 0.650, so the boundary sits at 0.60.
-#
-# The bands are CONTIGUOUS by default: every pair resolves to an action, none is
-# discarded. Ambiguity therefore resolves toward WAKE, which is deliberate — a
-# stray wake is a lit screen you did not ask for, a stray sleep is the screen
-# going black while you are using it. Bias the doubt at the harmless one.
-#
-# Leaving a gap between the bands is still legal (set sleep_min > wake_max) and
-# turns the space between them into a dead zone that fires nothing. That trades
-# stray actions for silent misses — the failure mode where you clap and nothing
-# happens at all. Contiguous was the better trade for Ben's hands.
+# One pair window for both actions. Panel state, not clap speed, chooses the action.
+# Historical count- and tempo-based gestures are documented in PROCESS.md.
 WAKE_GAP_RANGE_SECONDS = (
-    float(os.environ.get("CLAPWAKE_WAKE_MIN_GAP", "0.15")),
-    float(os.environ.get("CLAPWAKE_WAKE_MAX_GAP", "0.60")),
+    float(os.environ.get("CLAPWAKE_WAKE_MIN_GAP", "0.12")),
+    float(os.environ.get("CLAPWAKE_WAKE_MAX_GAP", "1.20")),
 )
-SLEEP_GAP_RANGE_SECONDS = (
-    float(os.environ.get("CLAPWAKE_SLEEP_MIN_GAP", "0.60")),
-    float(os.environ.get("CLAPWAKE_SLEEP_MAX_GAP", "1.20")),
-)
+# Both actions use the same pair window.
+SLEEP_GAP_RANGE_SECONDS = WAKE_GAP_RANGE_SECONDS
 if not (
-    0.12 <= WAKE_GAP_RANGE_SECONDS[0] < WAKE_GAP_RANGE_SECONDS[1]
-    and WAKE_GAP_RANGE_SECONDS[1] <= SLEEP_GAP_RANGE_SECONDS[0]
-    and SLEEP_GAP_RANGE_SECONDS[0] < SLEEP_GAP_RANGE_SECONDS[1] <= 1.50
+    0.12 <= WAKE_GAP_RANGE_SECONDS[0] < WAKE_GAP_RANGE_SECONDS[1] <= 1.50
 ):
     raise ValueError(
-        "clap gap bands must satisfy 0.12 <= wake_min < wake_max "
-        "<= sleep_min < sleep_max <= 1.50 (the wake band must close at or "
-        "before the sleep band opens)"
+        "clap pair band must satisfy 0.12 <= min < max <= 1.50"
     )
-# True when the bands touch: no gap can fall between them, so nothing is ignored.
-BANDS_ARE_CONTIGUOUS = WAKE_GAP_RANGE_SECONDS[1] >= SLEEP_GAP_RANGE_SECONDS[0]
+# One pair window: no dead zone between wake and sleep.
+BANDS_ARE_CONTIGUOUS = True
 # Band edges are inclusive within this tolerance. It absorbs float drift and the
 # POLL/blocksize quantisation, and it is far below human timing precision — no
 # one claps to a 5ms boundary, so a hard edge would only create phantom misses.
 GAP_EPSILON_SECONDS = 0.005
-# Below the wake band an onset is an echo of clap 1, not intent: ignore it but
+# Below the pair band an onset is an echo of clap 1, not intent: ignore it but
 # keep waiting, so an echo cannot eat the real second clap.
 ECHO_GAP_SECONDS = WAKE_GAP_RANGE_SECONDS[0] - GAP_EPSILON_SECONDS
-# Past the sleep band the two claps are unrelated; the later one starts a pair.
-PAIR_EXPIRY_SECONDS = SLEEP_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS
+# Past the pair band the two claps are unrelated; the later one starts a pair.
+PAIR_EXPIRY_SECONDS = WAKE_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS
 MAX_CONTINUOUS_LOUD_SECONDS = 0.22
 MIN_REARM_QUIET_SECONDS = 0.07
 # Busy gate: continuous audio (recording) blocks all counting.
@@ -90,46 +60,68 @@ MAX_BUSY_FRACTION = 0.25
 MIN_BUSY_SAMPLES = 30
 WAKE_COOLDOWN_SECONDS = 2.5
 SLEEP_COOLDOWN_SECONDS = 0.4
+# Sleep only fires if no real key/mouse event happened this recently. A person
+# typing is not clapping; the mic just hears their keyboard through the desk.
+SLEEP_REQUIRES_HID_IDLE_SECONDS = float(
+    os.environ.get("CLAPWAKE_SLEEP_HID_IDLE", "3.0")
+)
+# CGEvent idle and our monotonic stamp can disagree by a beat. Stay under a
+# keystroke gap so a real key after our F18 still counts as human.
+OWN_HID_MATCH_SLACK_SECONDS = 0.35
 ACTION_COOLDOWN_SECONDS = WAKE_COOLDOWN_SECONDS
 
 # Both gestures are two claps. The count is no longer what distinguishes them.
 CLAPS_PER_GESTURE = 2
 
-# External Samsung LS32CG51x — wake path history:
-# - caffeinate + BetterDisplay alone: panel stays black on deep idle (18:04).
-# - Sparse pulse train with NULL CGEvent source + hid:true: still often needs
-#   2–3 double-clap attempts (18:08 cancel-by-3rd, 18:08 full train no light,
-#   18:23 third try finally).
-# - Real Aula keyboard works via WindowServer iohideventsystem.queue.tickle.
-#
-# Hybrid wake (what Ben asked for):
-#   hear 2 claps → fire a keyboard-click equivalent (same class as Aula HID)
-#   + light OS backups (caffeinate -u, BetterDisplay DDC).
-# No mouse moves. No 15s dense spam. A few key-click retries cover deep DPMS.
+# Deep DisplayPort idle may need a real HID key as well as brightness commands.
+# Keep the sparse wake pulses; never move the cursor or request OS display sleep.
 BETTERDISPLAY_BIN = "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"
 DISPLAY_NAME = "LS32CG51x"
 HID_WAKE_BIN = os.path.join(os.path.dirname(__file__), ".venv", "bin", "clapwake-hid")
 WAKE_HID_CMD = [HID_WAKE_BIN]
 WAKE_CAFFEINATE_SECONDS = 30
 WAKE_CAFFEINATE_CMD = ["caffeinate", "-u", "-t", str(WAKE_CAFFEINATE_SECONDS)]
-# BetterDisplay DDC: force panel backlight on each wake pulse. HID alone often
-# leaves the Samsung black on deep DPMS; DDC can miss while the link is cold,
-# so both run together across the retry train.
+# BetterDisplay software brightness + DDC luminance. hardwareBacklight=off
+# reports off on LS32CG51x while luminance stays 100 and the panel stays lit.
+# HID still runs on wake for deep DPMS. OS display stays on (no displaysleepnow).
 WAKE_DDC_CMD = [
     BETTERDISPLAY_BIN,
     "set",
     f"--name={DISPLAY_NAME}",
-    "--hardwareBacklight=on",
+    "--brightness=1",
+    "--ddc",
+    "--vcp=luminance",
+    "--value=100",
 ]
-# Single key-down/up per offset (Fn — no glyph). Retries only for cold panel.
+SLEEP_DDC_CMD = [
+    BETTERDISPLAY_BIN,
+    "set",
+    f"--name={DISPLAY_NAME}",
+    "--brightness=0",
+    "--ddc",
+    "--vcp=luminance",
+    "--value=0",
+]
+# Single key-down/up per offset (F18 — no glyph). Retries only for cold panel.
 WAKE_KEY_CLICK_OFFSETS_SECONDS = (0.0, 0.8, 2.0, 4.0)
-# Virtual keycode 0x3F = Fn (inert; no character typed into focused apps).
-WAKE_KEY_CODE = 0x3F
+# F18 must match kWakeKeyCode in hidwake.c. Unlike Fn, it is a discrete key.
+# The regression test checks both implementations use keycode79.
+WAKE_KEY_CODE = 0x4F
 
 WAKE_PULSE_OFFSETS_SECONDS = WAKE_KEY_CLICK_OFFSETS_SECONDS  # back-compat name
 WAKE_COMMANDS = [WAKE_CAFFEINATE_CMD, WAKE_DDC_CMD]  # back-compat for tests/docs
-# Preserve normal macOS display sleep and the monitor's own backlight dimming.
-SLEEP_COMMANDS = [["pmset", "displaysleepnow"]]
+# DDC luminance 0 keeps the DisplayPort link and the session unlocked.
+# pmset displaysleepnow is clamshell sleep + immediate lock (PROCESS part 12).
+SLEEP_COMMANDS = [SLEEP_DDC_CMD]
+
+# Command success is not panel confirmation. Read both channels after an action.
+# Retry a bounded number of times and report unverified outcomes.
+PANEL_DARK_MAX = 0.05               # software brightness at/below = dark
+PANEL_LUM_DARK_MAX = 5.0            # DDC luminance at/below = dark
+PANEL_LIT_MIN = 0.95                # software brightness at/above = lit
+PANEL_LUM_LIT_MIN = 95.0            # DDC luminance at/above = lit
+PANEL_VERIFY_DELAY_SECONDS = 0.7    # DDC needs a beat before a get sees it
+PANEL_VERIFY_ATTEMPTS = 4           # extra set fires while unverified
 
 # CoreGraphics / IOKit paths (macOS frameworks; no pyobjc required).
 _CG_PATH = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
@@ -174,6 +166,12 @@ def _frameworks() -> dict[str, Any] | None:
         cg.CGEventPost.argtypes = [c_uint32, c_void_p]
         cg.CGEventCreateKeyboardEvent.restype = c_void_p
         cg.CGEventCreateKeyboardEvent.argtypes = [c_void_p, c_uint32, ctypes.c_bool]
+
+        cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+        cg.CGEventSourceSecondsSinceLastEventType.argtypes = [c_int32, c_uint32]
+        cg.CGSessionCopyCurrentDictionary.restype = c_void_p
+        cf.CFDictionaryGetValue.restype = c_void_p
+        cf.CFDictionaryGetValue.argtypes = [c_void_p, c_void_p]
 
         _fw.update({"cg": cg, "cf": cf, "iokit": iokit})
         return _fw
@@ -232,7 +230,7 @@ def keyboard_click(keycode: int = WAKE_KEY_CODE) -> bool:
 
     Uses CGEventSourceCreate(kCGEventSourceStateHIDSystemState) so WindowServer
     treats it like a real HID key (Aula path), not a NULL-source synthetic.
-    Never moves the mouse. Single inert key (default Fn) — no typed character.
+    Never moves the mouse. Single inert key (default F18) — no typed character.
     """
     fw = _frameworks()
     if fw is None:
@@ -247,8 +245,10 @@ def keyboard_click(keycode: int = WAKE_KEY_CODE) -> bool:
             kev = cg.CGEventCreateKeyboardEvent(source, keycode, key_down)
             if not kev:
                 continue
+            # HID tap only. Injecting here enters below the session, so the
+            # event already propagates up to it — posting the same event again
+            # at the session tap delivered every key TWICE to the focused app.
             cg.CGEventPost(_kCGHIDEventTap, kev)
-            cg.CGEventPost(_kCGSessionEventTap, kev)
             cf.CFRelease(kev)
             posted = True
         return posted
@@ -267,6 +267,113 @@ def keyboard_click(keycode: int = WAKE_KEY_CODE) -> bool:
 # Back-compat alias used by older notes/tests.
 def hid_tickle() -> bool:
     return keyboard_click()
+
+
+_kCGAnyInputEventType = 0xFFFFFFFF
+
+
+def _bd_get(*args: str) -> float | None:
+    """One BetterDisplay get parsed as a float; None on any failure."""
+    try:
+        proc = subprocess.run(
+            [BETTERDISPLAY_BIN, "get", f"--name={DISPLAY_NAME}", *args],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return float((proc.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def panel_levels() -> tuple[float | None, float | None]:
+    """(software brightness 0..1, DDC luminance 0..100); None per channel."""
+    return _bd_get("--brightness"), _bd_get("--ddc", "--vcp=luminance")
+
+
+def levels_are_dark(
+    brightness: float | None, luminance: float | None
+) -> bool:
+    """Dark if either channel is near zero; both unreadable biases toward wake."""
+    if brightness is not None and brightness <= PANEL_DARK_MAX:
+        return True
+    if luminance is not None and luminance <= PANEL_LUM_DARK_MAX:
+        return True
+    return brightness is None and luminance is None
+
+
+def levels_at_target(
+    brightness: float | None, luminance: float | None, dark: bool
+) -> bool:
+    """True only when BOTH channels read back at the target state."""
+    if brightness is None or luminance is None:
+        return False
+    if dark:
+        return (
+            brightness <= PANEL_DARK_MAX and luminance <= PANEL_LUM_DARK_MAX
+        )
+    return brightness >= PANEL_LIT_MIN and luminance >= PANEL_LUM_LIT_MIN
+
+
+def panel_is_dark() -> bool:
+    """True when the panel reads dark (or is unreadable -> wake bias).
+
+    NEVER call from the PortAudio callback: this shells out.
+    """
+    return levels_are_dark(*panel_levels())
+
+
+def hid_idle_seconds() -> float:
+    """Seconds since the last real human key/mouse event, or -1.0 if unknown.
+
+    NEVER call this from the PortAudio callback thread: it IPCs to WindowServer.
+    """
+    fw = _frameworks()
+    if fw is None:
+        return -1.0
+    try:
+        return float(
+            fw["cg"].CGEventSourceSecondsSinceLastEventType(
+                _kCGEventSourceStateHIDSystemState, _kCGAnyInputEventType
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+def screen_is_locked() -> bool:
+    """True when the login window owns the screen.
+
+    CGSSessionScreenIsLocked is absent from the session dict while unlocked and
+    present while locked, so presence alone is the answer. Returns False when
+    the state cannot be read — an unknown lock state must not block a wake.
+    """
+    fw = _frameworks()
+    if fw is None:
+        return False
+    cg, cf = fw["cg"], fw["cf"]
+    session = None
+    key = None
+    try:
+        session = cg.CGSessionCopyCurrentDictionary()
+        if not session:
+            return False
+        key = cf.CFStringCreateWithCString(
+            None, b"CGSSessionScreenIsLocked", _kCFStringEncodingUTF8
+        )
+        return bool(cf.CFDictionaryGetValue(session, key))
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if key:
+            cf.CFRelease(key)
+        if session:
+            cf.CFRelease(session)
 
 
 def hybrid_wake_once() -> dict[str, bool]:
@@ -358,12 +465,16 @@ def input_channels(device: dict[str, Any]) -> int:
         return 0
 
 
-def select_preferred_mic(sd: Any) -> tuple[int, str, int] | None:
+def select_preferred_mic(
+    sd: Any, *, emit_missing: bool = True
+) -> tuple[int, str, int] | None:
     """Return (index, name, max_input_channels) for the pinned mic, or None.
 
     Deliberately does NOT fall back to any other device: if the pinned mic is
     absent we want to fail loudly, not silently latch onto the built-in mic.
     Re-query every call so USB re-enumeration cannot leave a stale index.
+    The listen loop's host watch passes emit_missing=False so a 2s poll cannot
+    spam preferred_mic_absent while the stream is still open.
     """
     try:
         devices = list(sd.query_devices())
@@ -386,13 +497,39 @@ def select_preferred_mic(sd: Any) -> tuple[int, str, int] | None:
         if target in name.lower():
             return index, name, ch
 
-    emit_error(
-        "clapwake.device",
-        f"pinned mic {PREFERRED_MIC_NAME!r} not found; available inputs: "
-        + (", ".join(available) or "none"),
-        "preferred_mic_absent",
-    )
+    if emit_missing:
+        emit_error(
+            "clapwake.device",
+            f"pinned mic {PREFERRED_MIC_NAME!r} not found; available inputs: "
+            + (", ".join(available) or "none"),
+            "preferred_mic_absent",
+        )
     return None
+
+
+def refresh_device_list(sd: Any) -> bool:
+    """Rebuild PortAudio's cached device enumeration. True when it succeeded.
+
+    sd.query_devices() serves a list captured when PortAudio initialized. A mic
+    unplugged overnight and replugged in the morning therefore never reappears
+    in a long-lived process: the listener stays deaf for hours with the device
+    sitting on the USB bus, and only a manual restart fixes it. terminate +
+    initialize rebuilds the enumeration in place, so no relaunch is needed.
+
+    Call ONLY while no stream is open (the mic-absent path). Tearing the host
+    API down under a live callback is the crash run() warns about.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        emit_error(
+            "clapwake.device",
+            f"portaudio re-enumeration: {type(exc).__name__}: {exc}",
+            "device_refresh_failed",
+        )
+        return False
 
 
 def reconnect_backoff_seconds(fail_streak: int) -> float:
@@ -462,6 +599,9 @@ class ClapDetector:
         self._wake_gen_lock = threading.Lock()
         # Recent (timestamp, is_active) samples for the busy-environment gate.
         self._activity: deque[tuple[float, bool]] = deque()
+        # Last time this process posted HID (wake train). Sleep must not treat
+        # that as a human at the keyboard (09:48:59 sleep_suppressed after wake).
+        self._own_hid_mono = 0.0
 
     def _bump_wake_generation(self) -> int:
         """Invalidate prior cold-wake trains; return the new generation id."""
@@ -506,20 +646,18 @@ class ClapDetector:
         self._quiet_since = None
 
     def observe_peak(self, peak: float, now: float | None = None) -> None:
-        """Classify a clap pair by its tempo and fire on the second clap.
+        """Recognize a clap pair, then choose the action from panel brightness.
 
         - clap 1 → start a pair, do nothing
-        - clap 2 in the wake band  → wake, immediately
-        - clap 2 in the sleep band → sleep, immediately
-        - clap 2 in the dead zone  → ignore the pair (ambiguous, so refuse)
-        - onset before the wake band → echo of clap 1; ignore, keep waiting
-        - onset after the sleep band → too late to pair; it becomes clap 1
+        - clap 2 in the pair band, panel dark → wake
+        - clap 2 in the pair band, panel lit  → sleep
+        - onset before the pair band → echo of clap 1; ignore, keep waiting
+        - onset after the pair band → too late to pair; it becomes clap 1
 
-        Nothing is deferred, so no third onset can reinterpret a fired gesture.
-        Hysteresis + busy gate still apply (recording-safe).
+        Wake and sleep use the same clap speed. Hysteresis + busy gate still
+        apply (recording-safe).
         """
         now = time.monotonic() if now is None else now
-        action: str | None = None
         gap = 0.0
         with self._lock:
             self._record_activity(peak, now)
@@ -577,39 +715,32 @@ class ClapDetector:
 
             self._armed = False
             self.burst_count = 0
+            # Hold a short cooldown on the callback so clap-2's echo cannot
+            # start a second pair before the worker reads panel state.
+            self._cooldown_until = now + SLEEP_COOLDOWN_SECONDS
 
-            # gap already sits in [ECHO_GAP, PAIR_EXPIRY], so only the inner
-            # boundary is left to decide. The tolerance pads the WAKE ceiling
-            # only — never the sleep floor — so the bands cannot overlap however
-            # they are configured, and a gap sitting exactly on a shared edge
-            # resolves to wake. That is the harmless side of the doubt.
-            if gap <= WAKE_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS:
-                self._cooldown_until = now + WAKE_COOLDOWN_SECONDS
-                action = "wake"
-            elif (
-                BANDS_ARE_CONTIGUOUS
-                or gap >= SLEEP_GAP_RANGE_SECONDS[0] - GAP_EPSILON_SECONDS
-            ):
-                self._cooldown_until = now + SLEEP_COOLDOWN_SECONDS
-                action = "sleep"
-            else:
-                # Dead zone: the tempo matches neither gesture. Refuse to guess.
-                emit(
-                    {
-                        "component": "clapwake.detector",
-                        "event": "pair_ignored_dead_zone",
-                        "gap_s": round(gap, 3),
-                        "wake_band": list(WAKE_GAP_RANGE_SECONDS),
-                        "sleep_band": list(SLEEP_GAP_RANGE_SECONDS),
-                    },
-                    stream=sys.stdout,
-                )
-                return
+        # Same clap speed for on and off. Panel brightness chooses the action.
+        # Tests replace _run with a recorder and stub panel_is_dark; keep that
+        # path synchronous. Production shells out, so it must not run here.
+        if getattr(self._run, "__func__", None) is ClapDetector._run:
+            threading.Thread(
+                target=self._dispatch_pair,
+                args=(now, CLAPS_PER_GESTURE, gap),
+                name="clapwake-pair",
+                daemon=True,
+            ).start()
+        else:
+            self._dispatch_pair(now, CLAPS_PER_GESTURE, gap)
 
-        if action == "wake":
-            self._run(WAKE_COMMANDS, "wake", CLAPS_PER_GESTURE, gap=gap)
-        elif action == "sleep":
-            self._run(SLEEP_COMMANDS, "sleep", CLAPS_PER_GESTURE, gap=gap)
+    def _dispatch_pair(self, t0: float, count: int, gap: float) -> None:
+        dark = panel_is_dark()
+        action = "wake" if dark else "sleep"
+        with self._lock:
+            self._cooldown_until = max(
+                self._cooldown_until, t0 + SLEEP_COOLDOWN_SECONDS
+            )
+        commands = WAKE_COMMANDS if action == "wake" else SLEEP_COMMANDS
+        self._run(commands, action, count, gap=gap)
 
     def settle(self, now: float | None = None) -> None:
         """Abandon a lone clap once its partner can no longer arrive.
@@ -631,10 +762,7 @@ class ClapDetector:
         count: int,
         gap: float = 0.0,
     ) -> None:
-        """Fire OS actions. Wake = hybrid key-click; sleep is one-shot.
-
-        All work runs on a daemon worker so the PortAudio callback never blocks.
-        """
+        """Launch wake or gated dimming on daemon workers."""
         t0 = time.monotonic()
         if action == "wake":
             gen = self._bump_wake_generation()
@@ -661,24 +789,13 @@ class ClapDetector:
             ).start()
             return
 
-        # Sleep: kill any residual wake retries so key/DDC cannot re-light.
+        # Check input activity off the audio callback. Only a permitted dim action
+        # cancels wake retries or emits sleep_triggered.
         if action == "sleep":
-            cancelled = self._bump_wake_generation()
-            emit(
-                {
-                    "component": "clapwake.detector",
-                    "event": "sleep_triggered",
-                    "clap_count": count,
-                    "gap_s": round(gap, 3),
-                    "t0_mono": round(t0, 3),
-                    "cancelled_wake_gen": cancelled,
-                },
-                stream=sys.stdout,
-            )
             threading.Thread(
-                target=self._launch_commands,
-                args=(commands, action, t0, 0),
-                name=f"clapwake-{action}",
+                target=self._sleep_if_user_absent,
+                args=(commands, t0, count, gap),
+                name="clapwake-sleep-gate",
                 daemon=True,
             ).start()
             return
@@ -698,6 +815,67 @@ class ClapDetector:
             name=f"clapwake-{action}",
             daemon=True,
         ).start()
+
+    def _sleep_if_user_absent(
+        self,
+        commands: list[list[str]],
+        t0: float,
+        count: int,
+        gap: float,
+    ) -> None:
+        """Dim only when the session is unlocked and no recent human input is seen.
+
+        Desk-mounted microphones can hear keystrokes as claps. Ignore the wake
+        helper's own HID events, but keep the guard for newer human input.
+        """
+        idle = hid_idle_seconds()
+        locked = screen_is_locked()
+        # idle < 0 means the query failed; do not suppress on an unknown answer.
+        recent_input = 0.0 <= idle < SLEEP_REQUIRES_HID_IDLE_SECONDS
+        own_hid_is_last = False
+        if recent_input and self._own_hid_mono > 0:
+            own_age = time.monotonic() - self._own_hid_mono
+            # Last HID is not newer than our wake post → it is our F18, not Ben.
+            own_hid_is_last = idle + OWN_HID_MATCH_SLACK_SECONDS >= own_age
+            if own_hid_is_last:
+                recent_input = False
+        if locked or recent_input:
+            emit(
+                {
+                    "component": "clapwake.detector",
+                    "event": "sleep_suppressed",
+                    "reason": "screen_locked" if locked else "recent_hid_input",
+                    "gap_s": round(gap, 3),
+                    "hid_idle_s": round(idle, 2),
+                    "required_idle_s": SLEEP_REQUIRES_HID_IDLE_SECONDS,
+                    "screen_locked": locked,
+                    "own_hid_s": round(time.monotonic() - self._own_hid_mono, 2)
+                    if self._own_hid_mono
+                    else None,
+                },
+                stream=sys.stdout,
+            )
+            return
+
+        # Gate passed: only now cancel residual wake retries and act.
+        cancelled = self._bump_wake_generation()
+        emit(
+            {
+                "component": "clapwake.detector",
+                "event": "sleep_triggered",
+                "clap_count": count,
+                "gap_s": round(gap, 3),
+                "t0_mono": round(t0, 3),
+                "hid_idle_s": round(idle, 2),
+                "cancelled_wake_gen": cancelled,
+            },
+            stream=sys.stdout,
+        )
+        self._launch_commands(commands, "sleep", t0, 0)
+        self._verify_panel(
+            action="sleep", dark=True, gen=cancelled, t0=t0, count=count,
+            command=SLEEP_DDC_CMD,
+        )
 
     def _hybrid_wake(self, t0: float, count: int, gen: int) -> None:
         """2 claps → keyboard-click equivalent (+ few retries for deep DPMS).
@@ -738,6 +916,7 @@ class ClapDetector:
 
             launched_at = time.monotonic()
             native = hybrid_wake_once()
+            self._own_hid_mono = launched_at
             # Every pulse: IOHID + BetterDisplay DDC. caffeinate only on pulse 0.
             commands: list[list[str]] = [WAKE_HID_CMD, WAKE_DDC_CMD]
             if pulse_i == 0:
@@ -757,6 +936,57 @@ class ClapDetector:
                 },
                 stream=sys.stdout,
             )
+        # The fixed pulse train covers deep DPMS; this covers the panel. If
+        # every DDC set failed or landed late, keep re-firing until the read-
+        # back agrees — the 09:36 all-pulses-Failed case.
+        self._verify_panel(
+            action="wake", dark=False, gen=gen, t0=t0, count=count,
+            command=WAKE_DDC_CMD,
+        )
+
+    def _verify_panel(
+        self,
+        *,
+        action: str,
+        dark: bool,
+        gen: int,
+        t0: float,
+        count: int,
+        command: list[str],
+    ) -> None:
+        """Check both brightness channels and retry a mismatched target.
+
+        Check generation at the start of each round. The final refire has no
+        subsequent read-back; exhaustion reports the target as unverified.
+        """
+        for attempt in range(1, PANEL_VERIFY_ATTEMPTS + 1):
+            if not self._wake_generation_alive(gen):
+                return
+            time.sleep(PANEL_VERIFY_DELAY_SECONDS)
+            brightness, luminance = panel_levels()
+            at_target = levels_at_target(brightness, luminance, dark)
+            emit(
+                {
+                    "component": "clapwake.action",
+                    "event": f"{action}_verify",
+                    "clap_count": count,
+                    "attempt": attempt,
+                    "brightness": brightness,
+                    "luminance": luminance,
+                    "at_target": at_target,
+                    "dt_ms": int(round((time.monotonic() - t0) * 1000)),
+                },
+                stream=sys.stdout,
+            )
+            if at_target:
+                return
+            self._launch_commands([command], action, t0, attempt)
+        emit_error(
+            "clapwake.action",
+            f"panel never reached target after {PANEL_VERIFY_ATTEMPTS} checks",
+            f"{action}_unverified",
+            throttle=False,
+        )
 
     def _launch_commands(
         self,
@@ -844,6 +1074,8 @@ def run() -> int:
     - Open via a config matrix (mono/stereo, latency, rate, blocksize).
     - On open failure: exponential backoff (no 1Hz thrash), then a clean process
       restart. Never call PortAudio's private terminate API under a live callback.
+    - While the mic is absent, re-enumerate PortAudio each retry so an overnight
+      unplug/replug is picked up in-process (no launchd relaunch storm).
     - A stream is dead only when callbacks stop, not when the input is silent.
     - Heartbeat while listening so ops can see liveness in /tmp/clapwake.out.
     - Never exit on mic churn (launchd KeepAlive thrash is a non-goal).
@@ -886,6 +1118,18 @@ def run() -> int:
     while not stopped.is_set():
         selected = select_preferred_mic(sd)
         if selected is None:
+            # The mic is absent from PortAudio's *cached* enumeration, which is
+            # frozen at process start. After a nightly unplug the replugged mic
+            # would otherwise stay invisible for the life of this process. No
+            # stream is open here, so rebuild the list and re-check next tick.
+            refreshed = refresh_device_list(sd)
+            emit_error(
+                "clapwake.device",
+                f"pinned mic {PREFERRED_MIC_NAME!r} absent; portaudio "
+                f"re-enumerated={refreshed}; retry in "
+                f"{DEVICE_ABSENT_RETRY_SECONDS:.0f}s",
+                "device_enumeration_refreshed",
+            )
             stopped.wait(DEVICE_ABSENT_RETRY_SECONDS)
             continue
 
@@ -896,6 +1140,7 @@ def run() -> int:
         signal_seen = {"at": time.monotonic()}
         stream_failed = False
         opened = False
+        host_reason: str | None = None
         listen_started = 0.0
         last_heartbeat = 0.0
 
@@ -939,6 +1184,8 @@ def run() -> int:
                     last_heartbeat = listen_started
                     callback_seen["at"] = listen_started
                     signal_seen["at"] = listen_started
+                    watch = hostwatch.HostWatch(device_index)
+                    last_host_check = listen_started
                     emit(
                         {
                             "component": "clapwake.stream",
@@ -991,6 +1238,23 @@ def run() -> int:
                                 "audio_stream_dead",
                             )
                             break
+                        if now - last_host_check >= hostwatch.HOST_WATCH_SECONDS:
+                            last_host_check = now
+                            host_reason = watch.poll(
+                                select_preferred_mic(sd, emit_missing=False)
+                            )
+                            if host_reason:
+                                emit(
+                                    {
+                                        "component": "clapwake.stream",
+                                        "event": "host_reconnect",
+                                        "reason": host_reason,
+                                        "device_index": device_index,
+                                        "device_name": device_label,
+                                    },
+                                    stream=sys.stdout,
+                                )
+                                break
                 break  # left with-block (dead stream, stop, or clean close)
             except Exception as exc:  # noqa: BLE001
                 last_open_error = exc
@@ -1022,12 +1286,17 @@ def run() -> int:
                 )
                 return 75
 
+        stop_reason = (
+            "stream_failed"
+            if stream_failed
+            else (host_reason or "dead_or_signal")
+        )
         emit(
             {
                 "component": "clapwake.stream",
                 "event": "stopped",
                 "device_name": device_label,
-                "reason": "stream_failed" if stream_failed else "dead_or_signal",
+                "reason": stop_reason,
                 "fail_streak": reconnect_fail_streak,
                 "last_cfg": used_cfg,
             },
@@ -1036,7 +1305,26 @@ def run() -> int:
         if stopped.is_set():
             break
 
-        if stream_failed:
+        if host_reason == "power_source_changed":
+            # AC unplug/replug resets USB audio. Process-boundary restart is
+            # the recovery that actually unwedged CoreAudio on 2026-08-28.
+            emit(
+                {
+                    "component": "clapwake.stream",
+                    "event": "service_restart_requested",
+                    "failure_type": "power_source_changed",
+                    "root_cause": "AC/battery flipped; restart at process boundary",
+                    "fail_streak": 0,
+                },
+                stream=sys.stdout,
+            )
+            return 75
+
+        if host_reason:
+            # Mic pulled or USB index churn: re-pin in-process. Not a stall.
+            callback_stall_streak = 0
+            pause = RECONNECT_PAUSE_SECONDS
+        elif stream_failed:
             pause = reconnect_backoff_seconds(reconnect_fail_streak)
         else:
             # Clean dead-stream: re-pin quickly. Repeated callback loss is
@@ -1071,5 +1359,35 @@ def run() -> int:
     return 0
 
 
+def fire_hybrid_wake(*, source: str = "cli") -> None:
+    """Run the same wake pulse train used by a clap pair.
+
+    Blocks until the pulse train has been submitted. Used by `--wake` and by
+    the Chrome Remote Desktop session watcher so those paths cannot drift from
+    the clap fire path.
+    """
+    det = ClapDetector()
+    t0 = time.monotonic()
+    gen = det._bump_wake_generation()
+    emit(
+        {
+            "component": "clapwake.detector",
+            "event": "wake_triggered",
+            "source": source,
+            "t0_mono": round(t0, 3),
+            "mode": "hybrid_key_click",
+            "key_code": WAKE_KEY_CODE,
+            "retry_offsets": list(WAKE_KEY_CLICK_OFFSETS_SECONDS),
+            "wake_gen": gen,
+            "ax_trusted": ax_trusted(),
+        },
+        stream=sys.stdout,
+    )
+    det._hybrid_wake(t0, 0, gen)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--wake":
+        fire_hybrid_wake(source="cli")
+        raise SystemExit(0)
     raise SystemExit(run())
