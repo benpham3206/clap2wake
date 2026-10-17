@@ -452,8 +452,9 @@ private struct Panel: View {
         !model.loaded ? .secondary : !model.running || model.stalled ? .orange : .green
     }
 
+    // No outer ScrollView: MenuBarExtra sizes its window to the content's
+    // ideal height, and a ScrollView has none, so the panel was clipped.
     var body: some View {
-        ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("clap2wake").font(.headline)
@@ -517,12 +518,14 @@ private struct Panel: View {
                     Button("Quit") { NSApplication.shared.terminate(nil) }.accessibilityLabel("Quit")
                 }.buttonStyle(.borderless).font(.caption)
                 if !model.healthOutput.isEmpty {
-                    Text(model.healthOutput).font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        .accessibilityLabel("Health check output")
+                    ScrollView {
+                        Text(model.healthOutput).font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(height: 160).accessibilityLabel("Health check output")
                 }
             }.padding(18)
-        }.frame(width: 320).frame(maxHeight: 740)
+            .frame(width: 320)
+            .fixedSize(horizontal: false, vertical: true)
             .onAppear { model.visible = true }
             .onDisappear { model.visible = false }
     }
