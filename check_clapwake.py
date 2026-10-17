@@ -444,6 +444,15 @@ def main() -> int:
             else:
                 problems.append("Scarlett input not present in device list")
 
+    from clapwake import clamshell_sleep_armed
+
+    if clamshell_sleep_armed():
+        # Not a listener fault: display off will sleep the Mac and deafen the mic.
+        notes.append(
+            "clamshell_sleep=armed (display off sleeps the Mac; "
+            "fix: pmset -a disablesleep 1 as root)"
+        )
+
     repair = "--repair" in sys.argv
     action = repair_action(
         loaded=agent_loaded(),
