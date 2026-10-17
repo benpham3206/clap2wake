@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -23,35 +24,6 @@ from typing import Any
 
 import hostwatch
 
-# Keep the onset threshold above desk noise and the release level below clap tails.
-# Scarlett boom floor is ~0.01. Table drops crossed 0.50. 0.60 missed snaps.
-THRESH = 0.55                # onset level: a clap must peak at least this loud
-RELEASE = 0.08               # re-arm only after a real quiet (must stay << THRESH)
-# One pair window for both actions. Panel state, not clap speed, chooses the action.
-# Historical count- and tempo-based gestures are documented in PROCESS.md.
-WAKE_GAP_RANGE_SECONDS = (
-    float(os.environ.get("CLAPWAKE_WAKE_MIN_GAP", "0.12")),
-    float(os.environ.get("CLAPWAKE_WAKE_MAX_GAP", "1.20")),
-)
-# Both actions use the same pair window.
-SLEEP_GAP_RANGE_SECONDS = WAKE_GAP_RANGE_SECONDS
-if not (
-    0.12 <= WAKE_GAP_RANGE_SECONDS[0] < WAKE_GAP_RANGE_SECONDS[1] <= 1.50
-):
-    raise ValueError(
-        "clap pair band must satisfy 0.12 <= min < max <= 1.50"
-    )
-# One pair window: no dead zone between wake and sleep.
-BANDS_ARE_CONTIGUOUS = True
-# Band edges are inclusive within this tolerance. It absorbs float drift and the
-# POLL/blocksize quantisation, and it is far below human timing precision — no
-# one claps to a 5ms boundary, so a hard edge would only create phantom misses.
-GAP_EPSILON_SECONDS = 0.005
-# Below the pair band an onset is an echo of clap 1, not intent: ignore it but
-# keep waiting, so an echo cannot eat the real second clap.
-ECHO_GAP_SECONDS = WAKE_GAP_RANGE_SECONDS[0] - GAP_EPSILON_SECONDS
-# Past the pair band the two claps are unrelated; the later one starts a pair.
-PAIR_EXPIRY_SECONDS = WAKE_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS
 MAX_CONTINUOUS_LOUD_SECONDS = 0.22
 MIN_REARM_QUIET_SECONDS = 0.07
 # Busy gate: continuous audio (recording) blocks all counting.
@@ -458,6 +430,91 @@ def error_payload(component: str, root_cause: str, failure_type: str) -> dict[st
         "root_cause": root_cause,
         "failure_type": failure_type,
     }
+
+
+RELEASE = 0.08  # re-arm only after real quiet
+
+
+def load_settings() -> dict[str, float]:
+    """Read optional presets once; environment gap overrides remain authoritative."""
+    defaults = {"threshold": 0.55, "max_gap_s": 1.20}
+    path = os.path.expanduser(os.environ.get(
+        "CLAPWAKE_SETTINGS", "~/Library/Application Support/clapwake/settings.json"
+    ))
+    try:
+        with open(path, encoding="utf-8") as source:
+            settings = json.load(source)
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be a JSON object")
+    except FileNotFoundError:
+        return defaults
+    except (OSError, ValueError, UnicodeError) as exc:
+        emit_error("clapwake.settings", str(exc), "settings_invalid", throttle=False)
+        return defaults
+    invalid = []
+    min_gap = float(os.environ.get("CLAPWAKE_WAKE_MIN_GAP", "0.12"))
+    for key, low, high, floor in (
+        ("threshold", 0.20, 0.90, 2 * RELEASE),
+        ("max_gap_s", 0.50, 2.50, min_gap),
+    ):
+        if key not in settings:
+            continue
+        value = settings[key]
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and low <= value <= high and value > floor):
+            defaults[key] = float(value)
+        else:
+            invalid.append(key)
+    if invalid:
+        emit_error("clapwake.settings", "invalid value: " + ", ".join(invalid),
+                   "settings_invalid", throttle=False)
+    return defaults
+
+
+_settings = load_settings()
+# Keep the onset threshold above desk noise and the release level below clap tails.
+# Scarlett boom floor is ~0.01. Table drops crossed 0.50. 0.60 missed snaps.
+THRESH = _settings["threshold"]  # onset level
+# One pair window for both actions. Panel state, not clap speed, chooses the action.
+# Historical count- and tempo-based gestures are documented in PROCESS.md.
+WAKE_GAP_RANGE_SECONDS = (
+    float(os.environ.get("CLAPWAKE_WAKE_MIN_GAP", "0.12")),
+    float(os.environ.get("CLAPWAKE_WAKE_MAX_GAP", _settings["max_gap_s"])),
+)
+# Both actions use the same pair window.
+SLEEP_GAP_RANGE_SECONDS = WAKE_GAP_RANGE_SECONDS
+if not (
+    0.12 <= WAKE_GAP_RANGE_SECONDS[0] < WAKE_GAP_RANGE_SECONDS[1] <= 2.50
+):
+    raise ValueError(
+        "clap pair band must satisfy 0.12 <= min < max <= 2.50"
+    )
+# One pair window: no dead zone between wake and sleep.
+BANDS_ARE_CONTIGUOUS = True
+# Band edges are inclusive within this tolerance. It absorbs float drift and the
+# POLL/blocksize quantisation, and it is far below human timing precision — no
+# one claps to a 5ms boundary, so a hard edge would only create phantom misses.
+GAP_EPSILON_SECONDS = 0.005
+# Below the pair band an onset is an echo of clap 1, not intent: ignore it but
+# keep waiting, so an echo cannot eat the real second clap.
+ECHO_GAP_SECONDS = WAKE_GAP_RANGE_SECONDS[0] - GAP_EPSILON_SECONDS
+# Past the pair band the two claps are unrelated; the later one starts a pair.
+PAIR_EXPIRY_SECONDS = WAKE_GAP_RANGE_SECONDS[1] + GAP_EPSILON_SECONDS
+LEVEL_ADDRESS = ("127.0.0.1", 47811)
+LEVEL_INTERVAL_SECONDS = 0.05
+
+
+def send_level(sock: socket.socket | None, level: dict[str, float],
+               address: tuple[str, int] = LEVEL_ADDRESS) -> None:
+    peak = level["peak"]
+    level["peak"] = 0.0
+    if sock is None:
+        return
+    try:
+        sock.sendto(json.dumps({"peak": peak, "thresh": THRESH, "release": RELEASE},
+                               separators=(",", ":")).encode("utf-8"), address)
+    except OSError:
+        pass
 
 
 def import_audio_modules() -> tuple[Any, Any] | None:
@@ -1093,6 +1150,16 @@ def run() -> int:
 
     np, sd = modules
     detector = ClapDetector()
+    level = {"peak": 0.0}
+    level_socket = None
+    try:
+        level_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        level_socket.setblocking(False)
+    except OSError:
+        if level_socket is not None:
+            level_socket.close()
+        level_socket = None
+    last_level = 0.0
     stopped = threading.Event()
 
     def stop(_signum: int, _frame: Any) -> None:
@@ -1163,6 +1230,7 @@ def run() -> int:
             try:
                 callback_seen["at"] = time.monotonic()
                 peak = float(np.max(np.abs(indata)))
+                level["peak"] = max(level["peak"], peak)
                 if peak > 0.0:
                     signal_seen["at"] = callback_seen["at"]
                 detector.observe_peak(peak)
@@ -1219,6 +1287,9 @@ def run() -> int:
                     while not stopped.wait(POLL_SECONDS):
                         now = time.monotonic()
                         detector.settle(now)
+                        if now - last_level >= LEVEL_INTERVAL_SECONDS:
+                            last_level = now
+                            send_level(level_socket, level)
                         if now - last_heartbeat >= LISTEN_HEARTBEAT_SECONDS:
                             last_heartbeat = now
                             callback_stall_streak = 0
