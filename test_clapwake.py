@@ -5,7 +5,7 @@ Drives ClapDetector with an injected fake clock and stubbed action commands, so
 every gesture case is verified without real audio, real timers, or touching the
 display. Run:  ~/clapwake/.venv/bin/python3 ~/clapwake/test_clapwake.py
 
-Gesture model: one pair window. Panel dark -> wake, lit -> dim.
+Gesture model: one pair window. Dark -> wake, lit -> dim then delayed backlight off.
 """
 
 from __future__ import annotations
@@ -317,8 +317,8 @@ def run_sleep_gate(
 ) -> list[str]:
     """Drive _sleep_if_user_absent with a faked HID idle time and lock state.
 
-    levels scripts panel_levels() reads for the verify loop; default is one
-    dark read so the loop verifies on its first pass and stays offline.
+    levels scripts the verify loop; the default verifies sleep on the first
+    pass and keeps the test offline.
     """
     det = clapwake.ClapDetector() if det is None else det
     launched: list[str] = []
@@ -364,22 +364,48 @@ def test_sleep_fires_when_the_desk_is_idle() -> None:
     check("idle + unlocked -> sleep fires", run_sleep_gate(4.0, False), ["sleep"])
 
 
-def test_sleep_is_ddc_luminance_zero_not_os_display_sleep() -> None:
-    """hardwareBacklight=off reports off on this Samsung while luminance stays 100."""
-    cmds = clapwake.SLEEP_COMMANDS
-    check("sleep is a single command", len(cmds), 1)
-    argv = cmds[0]
-    joined = " ".join(argv)
-    check("sleep uses BetterDisplay", argv[0], clapwake.BETTERDISPLAY_BIN)
-    check("sleep names the Samsung", f"--name={clapwake.DISPLAY_NAME}" in argv, True)
-    check("sleep zeros software brightness", "--brightness=0" in argv, True)
-    check("sleep is DDC luminance", "--ddc" in argv and "--vcp=luminance" in argv, True)
-    check("sleep sets luminance 0", "--value=0" in argv, True)
-    check("sleep is not pmset displaysleepnow", "displaysleepnow" in joined, False)
-    check("sleep is not the no-op hardwareBacklight flag", "--hardwareBacklight=off" in argv, False)
+def test_sleep_dims_with_ddc_before_delayed_backlight_off() -> None:
+    check(
+        "sleep immediately dims with software brightness and DDC",
+        clapwake.SLEEP_COMMANDS,
+        [[
+            clapwake.BETTERDISPLAY_BIN,
+            "set",
+            f"--name={clapwake.DISPLAY_NAME}",
+            "--brightness=0",
+            "--ddc",
+            "--vcp=luminance",
+            "--value=0",
+        ]],
+    )
     wake = clapwake.WAKE_DDC_CMD
+    check("wake turns hardware backlight on", "--hardwareBacklight=on" in clapwake.WAKE_BACKLIGHT_CMD, True)
+    # A dark panel ignores DDC; bundling it with backlight-on fails the whole call.
+    check("backlight-on is not bundled with DDC", "--ddc" in clapwake.WAKE_BACKLIGHT_CMD or "--hardwareBacklight=on" in wake, False)
     check("wake restores brightness", "--brightness=1" in wake, True)
     check("wake restores DDC luminance", "--vcp=luminance" in wake and "--value=100" in wake, True)
+
+
+def test_sleep_never_schedules_backlight_off() -> None:
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval = interval
+            timers.append(self)
+
+        def start(self) -> None:
+            pass
+
+    saved = clapwake.threading.Timer
+    clapwake.threading.Timer = FakeTimer  # type: ignore[assignment]
+    try:
+        launched = run_sleep_gate(301.0, False)
+    finally:
+        clapwake.threading.Timer = saved
+    # Backlight-off left the Samsung unrecoverable in software (PROCESS 26).
+    check("sleep starts no delayed backlight-off", len(timers), 0)
+    check("only dimming runs immediately", launched, ["sleep"])
 
 
 def test_unknown_hid_idle_does_not_suppress() -> None:
@@ -399,12 +425,12 @@ def test_human_hid_after_own_wake_still_sleeps() -> None:
 # --- actions are durable: re-fired until the panel reads back at target -----
 
 
-def test_sleep_retries_until_panel_reads_dark() -> None:
-    """A lit read-back retries dimming; a dark read-back stops the retry loop."""
+def test_sleep_retries_until_panel_reads_dimmed() -> None:
+    """A lit read-back retries dimming; a dim read-back stops the retry loop."""
     launched = run_sleep_gate(
         60.0, False, levels=[(1.0, 100.0), (0.0, 0.0)]
     )
-    check("lit read-back re-fires the sleep set", launched, ["sleep", "sleep"])
+    check("lit read-back re-fires dimming", launched, ["sleep", "sleep"])
 
 
 def test_sleep_gives_up_after_bounded_retries() -> None:
@@ -698,11 +724,12 @@ def main() -> int:
         test_first_pair_while_hid_hot_still_sleeps,
         test_sleep_blocked_at_the_login_window,
         test_sleep_fires_when_the_desk_is_idle,
-        test_sleep_is_ddc_luminance_zero_not_os_display_sleep,
+        test_sleep_dims_with_ddc_before_delayed_backlight_off,
+        test_sleep_never_schedules_backlight_off,
         test_unknown_hid_idle_does_not_suppress,
         test_sleep_after_own_wake_hid_still_fires,
         test_human_hid_after_own_wake_still_sleeps,
-        test_sleep_retries_until_panel_reads_dark,
+        test_sleep_retries_until_panel_reads_dimmed,
         test_sleep_gives_up_after_bounded_retries,
         test_levels_are_dark_reads_either_channel,
         test_levels_at_target_needs_both_channels,

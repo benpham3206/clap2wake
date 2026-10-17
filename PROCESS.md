@@ -754,3 +754,128 @@ Not committed (left as local dirty tree for Ben).
 - Sleep no longer gates on HID idle. A clap pair on a lit panel sleeps.
 - Login window still suppresses. THRESH and the busy-room gate stay.
 - Removed `_hid_suppressed_at`, `_own_hid_mono`, and `hid_confirm`.
+
+---
+
+# Part 21: Onset threshold 0.35 → 0.50 (2026-09-21)
+
+## Verdict
+
+- Same-evening pairs included gaps of 0.122s, 0.139s, and 0.157s, just above
+  the echo floor, while the desk was in use. That shape is one hit ringing
+  twice, not two claps.
+- A 1.5s Scarlett capture with the listener still running peaked at 0.009.
+  The floor is not the gate. The second peak of a hit is.
+
+## What changed
+
+- `THRESH` is 0.50. Release stays 0.08. The pair window stays 0.12–1.20s.
+- A snap that no longer registers needs more microphone gain. Do not lower
+  `THRESH` without a `scope.py` reading of that snap.
+
+---
+
+# Part 22: Onset threshold 0.50 → 0.60 (2026-09-21)
+
+## Verdict
+
+- After the listener reloaded at 0.50, an object dropped on the table still
+  made a pair. Ben set the clap/snap gate at 0.60.
+
+## What changed
+
+- `THRESH` is 0.60. Release stays 0.08. The pair window stays 0.12–1.20s.
+
+---
+
+# Part 23: Onset threshold 0.60 → 0.55 (2026-09-21)
+
+## Verdict
+
+- 0.60 was too high for the snaps Ben wants. He set the gate at 0.55.
+
+## What changed
+
+- `THRESH` is 0.55. Release stays 0.08. The pair window stays 0.12–1.20s.
+
+---
+
+# Part 24: Display off sleeps the Mac, so the mic goes deaf (2026-09-25)
+
+## Verdict
+
+- Clap-wake with the display off is not a detector bug. The lid is shut
+  (`AppleClamshellState = Yes`) and `SleepDisabled` is not set. When the
+  Samsung drops off, macOS enters `Clamshell Sleep`. The Scarlett stream
+  stops, so no clap can be heard. `caffeinate -s` does not block this.
+- `pmset -g log`: `Clamshell Sleep` at 11:33:59, then nothing until a HID
+  FullWake at 12:11:19. 45 `Clamshell Sleep` entries on 09-20..09-25.
+- The Scarlett is on the Mac's own USB controller, not the monitor hub.
+- Clapwake logs for these misses were lost: `/tmp` is cleared at boot.
+
+## What changed
+
+- `clamshell_sleep_armed()` reads the lid state and `SleepDisabled`.
+- The delayed `hardwareBacklight=off` is skipped while clamshell sleep is
+  armed (`backlight_off_skipped`). The panel stays DDC-dimmed and the Mac
+  stays awake and listening.
+- `check_clapwake.py` notes `clamshell_sleep=armed`.
+
+## Ben's call (one-way: a system power setting)
+
+- `pmset -a disablesleep 1` (as root) stops clamshell sleep. Then the
+  backlight-off step runs again, and a Samsung power-off no longer deafens
+  the mic. The cost: the Mac does not sleep with the lid shut, also on
+  battery.
+
+---
+
+# Part 25: Backlight-on was bundled with DDC (2026-09-27)
+
+## Verdict
+
+- 20:11:00 pair was heard (`wake_triggered`, `gap_s` 0.453). The Mac was
+  awake (`SleepDisabled 1`). Every BetterDisplay wake call logged `Failed.`
+- With the backlight off, the panel does not answer DDC
+  (`get -ddc -vcp=luminance` → `Failed.`). The wake call sent
+  `--hardwareBacklight=on` and the DDC luminance set in one `set`. The DDC
+  part failed, so the whole call failed, and the backlight stayed off.
+- Proof: `set --hardwareBacklight=on` alone → rc 0, backlight `on`, DDC
+  luminance reads 100 again.
+
+## What changed
+
+- `WAKE_BACKLIGHT_CMD` is its own call. Each wake pulse and each verify
+  refire sends it before `WAKE_DDC_CMD`.
+
+## Still open
+
+- `clapwake-hid` logs `IOHID post-event access is not granted` since
+  2026-09-25. The F18 pulse does nothing. Wake worked without it.
+
+---
+
+# Part 26: No hardware backlight-off (2026-09-27)
+
+## Verdict
+
+- Part 25 fix did not wake the panel. Backlight off at 20:20:22. Eight
+  pairs 20:20:25–20:20:39 were heard. Every BetterDisplay call failed,
+  also `--hardwareBacklight=on` alone. Ben pressed the power button.
+- History: the proven path is Part 14/18 (DDC luminance 0 ↔ 100, live
+  round-trip verified). The 5-minute backlight-off was new on 2026-09-25
+  and uncommitted. Part 12 had already named monitor power-off as the
+  wrong state.
+
+## What changed
+
+- Sleep dims only. The delayed `hardwareBacklight=off` is not scheduled.
+  Test `test_sleep_never_schedules_backlight_off` locks this.
+- Removed `_backlight_off_if_still_dimmed`, `BACKLIGHT_OFF_CMD`, and its test.
+
+## Probe (20:28:45)
+
+- `set --hardwareBacklight=off`, then `set --hardwareBacklight=on` every
+  3s. Every set and every `get -hardwareBacklight` → `Failed.` for 90s.
+  The 93s success was Ben's power button. After backlight-off, the
+  Samsung does not answer DDC. No software wake from this state.

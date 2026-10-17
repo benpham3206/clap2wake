@@ -24,8 +24,8 @@ from typing import Any
 import hostwatch
 
 # Keep the onset threshold above desk noise and the release level below clap tails.
-# Quieter snaps may need microphone gain adjustment; measure with scope.py first.
-THRESH = 0.35                # onset level: a clap must peak at least this loud
+# Scarlett boom floor is ~0.01. Table drops crossed 0.50. 0.60 missed snaps.
+THRESH = 0.55                # onset level: a clap must peak at least this loud
 RELEASE = 0.08               # re-arm only after a real quiet (must stay << THRESH)
 # One pair window for both actions. Panel state, not clap speed, chooses the action.
 # Historical count- and tempo-based gestures are documented in PROCESS.md.
@@ -73,9 +73,16 @@ HID_WAKE_BIN = os.path.join(os.path.dirname(__file__), ".venv", "bin", "clapwake
 WAKE_HID_CMD = [HID_WAKE_BIN]
 WAKE_CAFFEINATE_SECONDS = 30
 WAKE_CAFFEINATE_CMD = ["caffeinate", "-u", "-t", str(WAKE_CAFFEINATE_SECONDS)]
-# BetterDisplay software brightness + DDC luminance. hardwareBacklight=off
-# reports off on LS32CG51x while luminance stays 100 and the panel stays lit.
+# Wake restores the backlight plus the saved software/DDC brightness levels.
 # HID still runs on wake for deep DPMS. OS display stays on (no displaysleepnow).
+# Backlight-on is its own call: with the backlight off the panel ignores DDC,
+# and one combined `set` fails whole, so the backlight never came on.
+WAKE_BACKLIGHT_CMD = [
+    BETTERDISPLAY_BIN,
+    "set",
+    f"--name={DISPLAY_NAME}",
+    "--hardwareBacklight=on",
+]
 WAKE_DDC_CMD = [
     BETTERDISPLAY_BIN,
     "set",
@@ -101,8 +108,8 @@ WAKE_KEY_CLICK_OFFSETS_SECONDS = (0.0, 0.8, 2.0, 4.0)
 WAKE_KEY_CODE = 0x4F
 
 WAKE_PULSE_OFFSETS_SECONDS = WAKE_KEY_CLICK_OFFSETS_SECONDS  # back-compat name
-WAKE_COMMANDS = [WAKE_CAFFEINATE_CMD, WAKE_DDC_CMD]  # back-compat for tests/docs
-# DDC luminance 0 keeps the DisplayPort link and the session unlocked.
+WAKE_COMMANDS = [WAKE_CAFFEINATE_CMD, WAKE_BACKLIGHT_CMD, WAKE_DDC_CMD]  # back-compat for tests/docs
+# DDC dimming keeps the DisplayPort link and the session unlocked.
 # pmset displaysleepnow is clamshell sleep + immediate lock (PROCESS part 12).
 SLEEP_COMMANDS = [SLEEP_DDC_CMD]
 
@@ -318,6 +325,29 @@ def panel_is_dark() -> bool:
     NEVER call from the PortAudio callback: this shells out.
     """
     return levels_are_dark(*panel_levels())
+
+
+def clamshell_sleep_armed() -> bool:
+    """Lid shut and sleep not disabled: losing the last display sleeps the Mac.
+
+    Asleep, the Scarlett stream stops, so no clap can wake it (PROCESS part 24).
+    Unreadable state counts as armed.
+    """
+    try:
+        lid = subprocess.run(
+            ["ioreg", "-r", "-k", "AppleClamshellState", "-d", "1"],
+            capture_output=True, text=True, timeout=2.0,
+        ).stdout
+        pm = subprocess.run(
+            ["pmset", "-g"], capture_output=True, text=True, timeout=2.0
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return True
+    lid_open = '"AppleClamshellState" = No' in lid
+    sleep_disabled = any(
+        line.split()[:2] == ["SleepDisabled", "1"] for line in pm.splitlines()
+    )
+    return not lid_open and not sleep_disabled
 
 
 def hid_idle_seconds() -> float:
@@ -812,7 +842,7 @@ class ClapDetector:
         count: int,
         gap: float,
     ) -> None:
-        """Dim when the session is unlocked.
+        """Dim when the session is unlocked, then schedule backlight-off.
 
         Recent keyboard or mouse input used to drop the first pair
         (11:52:43 sleep_suppressed). A clap pair is now the intent.
@@ -848,9 +878,11 @@ class ClapDetector:
             stream=sys.stdout,
         )
         self._launch_commands(commands, "sleep", t0, 0)
+        # ponytail: no delayed hardwareBacklight=off. 2026-09-27 20:20: once the
+        # Samsung backlight is off, no software path turned it back on (PROCESS 26).
         self._verify_panel(
             action="sleep", dark=True, gen=cancelled, t0=t0, count=count,
-            command=SLEEP_DDC_CMD,
+            commands=[SLEEP_DDC_CMD],
         )
 
     def _hybrid_wake(self, t0: float, count: int, gen: int) -> None:
@@ -893,7 +925,7 @@ class ClapDetector:
             launched_at = time.monotonic()
             native = hybrid_wake_once()
             # Every pulse: IOHID + BetterDisplay DDC. caffeinate only on pulse 0.
-            commands: list[list[str]] = [WAKE_HID_CMD, WAKE_DDC_CMD]
+            commands: list[list[str]] = [WAKE_HID_CMD, WAKE_BACKLIGHT_CMD, WAKE_DDC_CMD]
             if pulse_i == 0:
                 commands.insert(1, WAKE_CAFFEINATE_CMD)
             self._launch_commands(commands, "wake", t0, pulse_i)
@@ -916,7 +948,7 @@ class ClapDetector:
         # back agrees — the 09:36 all-pulses-Failed case.
         self._verify_panel(
             action="wake", dark=False, gen=gen, t0=t0, count=count,
-            command=WAKE_DDC_CMD,
+            commands=[WAKE_BACKLIGHT_CMD, WAKE_DDC_CMD],
         )
 
     def _verify_panel(
@@ -927,7 +959,7 @@ class ClapDetector:
         gen: int,
         t0: float,
         count: int,
-        command: list[str],
+        commands: list[list[str]],
     ) -> None:
         """Check both brightness channels and retry a mismatched target.
 
@@ -955,7 +987,7 @@ class ClapDetector:
             )
             if at_target:
                 return
-            self._launch_commands([command], action, t0, attempt)
+            self._launch_commands(commands, action, t0, attempt)
         emit_error(
             "clapwake.action",
             f"panel never reached target after {PANEL_VERIFY_ATTEMPTS} checks",
