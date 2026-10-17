@@ -10,9 +10,181 @@ Gesture model: one pair window. Dark -> wake, lit -> dim then delayed backlight 
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+# Isolate import from the user's settings, even when this test is imported.
+_settings_sandbox = tempfile.TemporaryDirectory()
+os.environ["CLAPWAKE_SETTINGS"] = str(Path(_settings_sandbox.name) / "missing.json")
 import clapwake
+
+# Failure cases before implementation: missing/unreadable files, malformed JSON,
+# non-object JSON, invalid types, NaN/infinity, per-key bounds, environment
+# precedence, inconsistent derived constants, lost peak/reset, and UDP failure.
+
+
+def settings_import(contents: str | None, **overrides: str) -> tuple[dict, list]:
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "settings.json"
+        if contents is not None:
+            path.write_text(contents)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CLAPWAKE_")}
+        env.update(CLAPWAKE_SETTINGS=str(path), **overrides)
+        result = subprocess.run(
+            [sys.executable, "-c", "import json, clapwake as c; "
+             "print(json.dumps([c.THRESH, c.WAKE_GAP_RANGE_SECONDS, "
+             "c.ECHO_GAP_SECONDS, c.PAIR_EXPIRY_SECONDS]))"],
+            cwd=Path(__file__).resolve().parent, env=env,
+            capture_output=True, text=True, check=True,
+        )
+        return json.loads(result.stdout), [json.loads(s) for s in result.stderr.splitlines()]
+
+
+def test_settings_missing_uses_defaults() -> None:
+    values, errors = settings_import(None)
+    assert values[:2] == [0.55, [0.12, 1.2]] and not errors
+
+
+def test_settings_bad_json_uses_defaults() -> None:
+    for content in ("{broken", "[]", "null"):
+        values, errors = settings_import(content)
+        assert values[:2] == [0.55, [0.12, 1.2]] and len(errors) == 1
+
+
+def test_settings_invalid_key_preserves_valid_key() -> None:
+    for invalid in (0.19, 0.91, "loud", None, True, float("nan"), float("inf")):
+        values, errors = settings_import(json.dumps({"threshold": invalid, "max_gap_s": 1.6}))
+        assert values[:2] == [0.55, [0.12, 1.6]] and len(errors) == 1
+    for invalid in (0.49, 2.51, "slow", None, False):
+        values, errors = settings_import(json.dumps({"threshold": 0.45, "max_gap_s": invalid}))
+        assert values[:2] == [0.45, [0.12, 1.2]] and len(errors) == 1
+
+
+def test_settings_env_beats_file() -> None:
+    values, errors = settings_import('{"threshold":0.65,"max_gap_s":1.6}',
+                                     CLAPWAKE_WAKE_MIN_GAP="0.2", CLAPWAKE_WAKE_MAX_GAP="0.8")
+    assert values[:2] == [0.65, [0.2, 0.8]] and not errors
+
+
+def test_settings_bounds_and_derived_constants() -> None:
+    for threshold, gap in ((0.2, 0.5), (0.9, 2.5), (0.45, 1.6)):
+        values, errors = settings_import(json.dumps({"threshold": threshold, "max_gap_s": gap, "extra": 42}))
+        assert values[:2] == [threshold, [0.12, gap]] and not errors
+        assert abs(values[2] - 0.115) < 1e-9
+        assert abs(values[3] - (gap + 0.005)) < 1e-9
+    values, errors = settings_import('{"max_gap_s":0.8}', CLAPWAKE_WAKE_MIN_GAP="0.9")
+    assert values[1] == [0.9, 1.2] and len(errors) == 1
+
+
+def test_level_feed_udp_payload_and_reset() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.setblocking(False)
+            level = {"peak": 0.73}
+            clapwake.send_level(sender, level, receiver.getsockname())
+            payload = json.loads(receiver.recv(1024))
+            assert payload == {"peak": 0.73, "thresh": clapwake.THRESH, "release": clapwake.RELEASE}
+            assert level["peak"] == 0.0
+
+
+def test_level_feed_send_error_is_ignored() -> None:
+    sender = Mock()
+    sender.sendto.side_effect = OSError("no receiver")
+    level = {"peak": 0.91}
+    clapwake.send_level(sender, level)
+    assert level["peak"] == 0.0
+
+
+def test_callback_to_udp_pipeline() -> None:
+    """Run the capture loop through real UDP; replace only hardware boundaries.
+
+    Failures: no packets, sub-10 Hz updates, lost maxima, stale peaks after
+    silence, or an action from below-threshold input. No live service is used.
+    """
+    handlers = {}
+    packets = []
+    stop_reader = threading.Event()
+    emitted = []
+    errors = []
+    action = Mock()
+
+    class Stream:
+        def __init__(self, *, callback, **_kwargs):
+            self.callback = callback
+
+        def __enter__(self):
+            def produce():
+                started = time.monotonic()
+                index = 0
+                while time.monotonic() - started < 1.2:
+                    value = (0.01, 0.31, 0.07, 0.01)[index % 4]
+                    if time.monotonic() - started > 0.5:
+                        value = 0.0
+                    self.callback([value], 1, None, None)
+                    index += 1
+                    time.sleep(0.004)
+                handlers[clapwake.signal.SIGTERM](None, None)
+            self.thread = threading.Thread(target=produce)
+            self.thread.start()
+            return self
+
+        def __exit__(self, *_args):
+            self.thread.join(timeout=3)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(0.1)
+
+        def receive():
+            while not stop_reader.is_set():
+                try:
+                    payload = json.loads(receiver.recv(1024))
+                    packets.append((time.monotonic(), payload))
+                except socket.timeout:
+                    pass
+
+        reader = threading.Thread(target=receive)
+        reader.start()
+        try:
+            with (
+                patch.object(clapwake, "import_audio_modules", return_value=(
+                    SimpleNamespace(max=max, abs=lambda values: values),
+                    SimpleNamespace(InputStream=Stream))),
+                patch.object(clapwake, "select_preferred_mic", return_value=(0, "Synthetic mic", 1)),
+                patch.object(clapwake, "ax_trusted", return_value=True),
+                patch.object(clapwake.hostwatch, "HostWatch", return_value=SimpleNamespace(poll=lambda _: None)),
+                patch.object(clapwake.signal, "signal", side_effect=lambda sig, handler: handlers.update({sig: handler})),
+                patch.object(clapwake, "emit", side_effect=lambda payload, **_: emitted.append(payload)),
+                patch.object(clapwake, "emit_error", side_effect=lambda *args, **_: errors.append(args)),
+                patch.object(clapwake.ClapDetector, "_run", action),
+                patch.object(clapwake.send_level, "__defaults__", (receiver.getsockname(),)),
+            ):
+                assert clapwake.run() == 0
+        finally:
+            stop_reader.set()
+            reader.join(timeout=2)
+    assert not action.called, action.call_args_list
+    assert not errors, errors
+    assert len(packets) >= 10, packets
+    rate = (len(packets) - 1) / (packets[-1][0] - packets[0][0])
+    assert 10 <= rate <= 25, rate
+    assert any(abs(payload["peak"] - 0.31) < 1e-9 for _, payload in packets)
+    assert all(payload["peak"] == 0 for _, payload in packets[-5:])
+    assert all(payload["thresh"] == clapwake.THRESH for _, payload in packets)
+    assert any(event.get("event") == "listening" for event in emitted)
+    print(f"[PASS] callback -> UDP: {len(packets)} packets, {rate:.1f} Hz; peak/reset verified")
 
 
 class Recorder:
@@ -697,6 +869,14 @@ def test_repair_action_starts_and_kicks_a_dead_listener() -> None:
 
 def main() -> int:
     tests = [
+        test_settings_missing_uses_defaults,
+        test_settings_bad_json_uses_defaults,
+        test_settings_invalid_key_preserves_valid_key,
+        test_settings_env_beats_file,
+        test_settings_bounds_and_derived_constants,
+        test_level_feed_udp_payload_and_reset,
+        test_level_feed_send_error_is_ignored,
+        test_callback_to_udp_pipeline,
         test_fast_pair_wakes_immediately,
         test_slow_pair_sleeps_immediately,
         test_wake_needs_no_settle,

@@ -88,7 +88,7 @@ LaunchAgent environment overrides:
 
 - `CLAPWAKE_MIC_NAME`: preferred microphone name substring; default `Scarlett`.
 - `CLAPWAKE_WAKE_MIN_GAP` / `CLAPWAKE_WAKE_MAX_GAP`: the shared pair window.
-  Bounds must satisfy `0.12 <= min < max <= 1.50`.
+  Bounds must satisfy `0.12 <= min < max <= 2.50`.
 
 Logs are `/tmp/clapwake.out` and `/tmp/clapwake.err`. A trigger records a request;
 read-back records whether both brightness channels reached their target range.
@@ -103,3 +103,26 @@ Some diagnostic field names retain the older wake/sleep-band terminology.
 
 These are offline tests with simulated peaks and stubbed actions. They do not
 replace a physical clap/snap test on the configured microphone and monitor.
+
+## Menu bar
+
+Requires macOS 14 or later and the Swift command line tools. Run
+`bash menubar/build.sh`. The app is `menubar/build/Clapwake Bar.app`.
+Use `bash menubar/build.sh --install` to copy it to `~/Applications/`.
+The supplied `com.you.clapwake.bar.plist` starts that copy at login.
+Set its app path before you install the plist in `~/Library/LaunchAgents/`.
+The build does not install or start either LaunchAgent.
+
+The panel shows the mic level and recent events. It controls the listener and
+keep-awake state. Turn keep-awake off before you pack the Mac. A power change
+can require an administrator password. The app does not store the password.
+The listener must run the new code to send levels on `127.0.0.1:47811`.
+
+Settings use `~/Library/Application Support/clapwake/settings.json`.
+`CLAPWAKE_SETTINGS` changes this path. Set it for both app and listener.
+The keys are `threshold` (0.20–0.90) and `max_gap_s` (0.50–2.50).
+The threshold must exceed twice the release level. The gap must exceed the
+minimum gap. Environment gap values take priority. A panel change saves the
+file and restarts the listener. "Applied" confirms a matching listening event.
+The app uses `~/clapwake` for the health check. Set `CLAPWAKE_DIR` to use
+another repository path.

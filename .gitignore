@@ -7,3 +7,4 @@ __pycache__/
 *.key
 .grok/
 .DS_Store
+menubar/build/
