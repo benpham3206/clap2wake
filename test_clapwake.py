@@ -5,14 +5,186 @@ Drives ClapDetector with an injected fake clock and stubbed action commands, so
 every gesture case is verified without real audio, real timers, or touching the
 display. Run:  ~/clapwake/.venv/bin/python3 ~/clapwake/test_clapwake.py
 
-Gesture model: one pair window. Panel dark -> wake, lit -> dim.
+Gesture model: one pair window. Dark -> wake, lit -> dim then delayed backlight off.
 """
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+# Isolate import from the user's settings, even when this test is imported.
+_settings_sandbox = tempfile.TemporaryDirectory()
+os.environ["CLAPWAKE_SETTINGS"] = str(Path(_settings_sandbox.name) / "missing.json")
 import clapwake
+
+# Failure cases before implementation: missing/unreadable files, malformed JSON,
+# non-object JSON, invalid types, NaN/infinity, per-key bounds, environment
+# precedence, inconsistent derived constants, lost peak/reset, and UDP failure.
+
+
+def settings_import(contents: str | None, **overrides: str) -> tuple[dict, list]:
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "settings.json"
+        if contents is not None:
+            path.write_text(contents)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CLAPWAKE_")}
+        env.update(CLAPWAKE_SETTINGS=str(path), **overrides)
+        result = subprocess.run(
+            [sys.executable, "-c", "import json, clapwake as c; "
+             "print(json.dumps([c.THRESH, c.WAKE_GAP_RANGE_SECONDS, "
+             "c.ECHO_GAP_SECONDS, c.PAIR_EXPIRY_SECONDS]))"],
+            cwd=Path(__file__).resolve().parent, env=env,
+            capture_output=True, text=True, check=True,
+        )
+        return json.loads(result.stdout), [json.loads(s) for s in result.stderr.splitlines()]
+
+
+def test_settings_missing_uses_defaults() -> None:
+    values, errors = settings_import(None)
+    assert values[:2] == [0.55, [0.12, 1.2]] and not errors
+
+
+def test_settings_bad_json_uses_defaults() -> None:
+    for content in ("{broken", "[]", "null"):
+        values, errors = settings_import(content)
+        assert values[:2] == [0.55, [0.12, 1.2]] and len(errors) == 1
+
+
+def test_settings_invalid_key_preserves_valid_key() -> None:
+    for invalid in (0.19, 0.91, "loud", None, True, float("nan"), float("inf")):
+        values, errors = settings_import(json.dumps({"threshold": invalid, "max_gap_s": 1.6}))
+        assert values[:2] == [0.55, [0.12, 1.6]] and len(errors) == 1
+    for invalid in (0.49, 2.51, "slow", None, False):
+        values, errors = settings_import(json.dumps({"threshold": 0.45, "max_gap_s": invalid}))
+        assert values[:2] == [0.45, [0.12, 1.2]] and len(errors) == 1
+
+
+def test_settings_env_beats_file() -> None:
+    values, errors = settings_import('{"threshold":0.65,"max_gap_s":1.6}',
+                                     CLAPWAKE_WAKE_MIN_GAP="0.2", CLAPWAKE_WAKE_MAX_GAP="0.8")
+    assert values[:2] == [0.65, [0.2, 0.8]] and not errors
+
+
+def test_settings_bounds_and_derived_constants() -> None:
+    for threshold, gap in ((0.2, 0.5), (0.9, 2.5), (0.45, 1.6)):
+        values, errors = settings_import(json.dumps({"threshold": threshold, "max_gap_s": gap, "extra": 42}))
+        assert values[:2] == [threshold, [0.12, gap]] and not errors
+        assert abs(values[2] - 0.115) < 1e-9
+        assert abs(values[3] - (gap + 0.005)) < 1e-9
+    values, errors = settings_import('{"max_gap_s":0.8}', CLAPWAKE_WAKE_MIN_GAP="0.9")
+    assert values[1] == [0.9, 1.2] and len(errors) == 1
+
+
+def test_level_feed_udp_payload_and_reset() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.setblocking(False)
+            level = {"peak": 0.73}
+            clapwake.send_level(sender, level, receiver.getsockname())
+            payload = json.loads(receiver.recv(1024))
+            assert payload == {"peak": 0.73, "thresh": clapwake.THRESH, "release": clapwake.RELEASE}
+            assert level["peak"] == 0.0
+
+
+def test_level_feed_send_error_is_ignored() -> None:
+    sender = Mock()
+    sender.sendto.side_effect = OSError("no receiver")
+    level = {"peak": 0.91}
+    clapwake.send_level(sender, level)
+    assert level["peak"] == 0.0
+
+
+def test_callback_to_udp_pipeline() -> None:
+    """Run the capture loop through real UDP; replace only hardware boundaries.
+
+    Failures: no packets, sub-10 Hz updates, lost maxima, stale peaks after
+    silence, or an action from below-threshold input. No live service is used.
+    """
+    handlers = {}
+    packets = []
+    stop_reader = threading.Event()
+    emitted = []
+    errors = []
+    action = Mock()
+
+    class Stream:
+        def __init__(self, *, callback, **_kwargs):
+            self.callback = callback
+
+        def __enter__(self):
+            def produce():
+                started = time.monotonic()
+                index = 0
+                while time.monotonic() - started < 1.2:
+                    value = (0.01, 0.31, 0.07, 0.01)[index % 4]
+                    if time.monotonic() - started > 0.5:
+                        value = 0.0
+                    self.callback([value], 1, None, None)
+                    index += 1
+                    time.sleep(0.004)
+                handlers[clapwake.signal.SIGTERM](None, None)
+            self.thread = threading.Thread(target=produce)
+            self.thread.start()
+            return self
+
+        def __exit__(self, *_args):
+            self.thread.join(timeout=3)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(0.1)
+
+        def receive():
+            while not stop_reader.is_set():
+                try:
+                    payload = json.loads(receiver.recv(1024))
+                    packets.append((time.monotonic(), payload))
+                except socket.timeout:
+                    pass
+
+        reader = threading.Thread(target=receive)
+        reader.start()
+        try:
+            with (
+                patch.object(clapwake, "import_audio_modules", return_value=(
+                    SimpleNamespace(max=max, abs=lambda values: values),
+                    SimpleNamespace(InputStream=Stream))),
+                patch.object(clapwake, "select_preferred_mic", return_value=(0, "Synthetic mic", 1)),
+                patch.object(clapwake, "ax_trusted", return_value=True),
+                patch.object(clapwake.hostwatch, "HostWatch", return_value=SimpleNamespace(poll=lambda _: None)),
+                patch.object(clapwake.signal, "signal", side_effect=lambda sig, handler: handlers.update({sig: handler})),
+                patch.object(clapwake, "emit", side_effect=lambda payload, **_: emitted.append(payload)),
+                patch.object(clapwake, "emit_error", side_effect=lambda *args, **_: errors.append(args)),
+                patch.object(clapwake.ClapDetector, "_run", action),
+                patch.object(clapwake.send_level, "__defaults__", (receiver.getsockname(),)),
+            ):
+                assert clapwake.run() == 0
+        finally:
+            stop_reader.set()
+            reader.join(timeout=2)
+    assert not action.called, action.call_args_list
+    assert not errors, errors
+    assert len(packets) >= 10, packets
+    rate = (len(packets) - 1) / (packets[-1][0] - packets[0][0])
+    assert 10 <= rate <= 25, rate
+    assert any(abs(payload["peak"] - 0.31) < 1e-9 for _, payload in packets)
+    assert all(payload["peak"] == 0 for _, payload in packets[-5:])
+    assert all(payload["thresh"] == clapwake.THRESH for _, payload in packets)
+    assert any(event.get("event") == "listening" for event in emitted)
+    print(f"[PASS] callback -> UDP: {len(packets)} packets, {rate:.1f} Hz; peak/reset verified")
 
 
 class Recorder:
@@ -317,8 +489,8 @@ def run_sleep_gate(
 ) -> list[str]:
     """Drive _sleep_if_user_absent with a faked HID idle time and lock state.
 
-    levels scripts panel_levels() reads for the verify loop; default is one
-    dark read so the loop verifies on its first pass and stays offline.
+    levels scripts the verify loop; the default verifies sleep on the first
+    pass and keeps the test offline.
     """
     det = clapwake.ClapDetector() if det is None else det
     launched: list[str] = []
@@ -364,22 +536,48 @@ def test_sleep_fires_when_the_desk_is_idle() -> None:
     check("idle + unlocked -> sleep fires", run_sleep_gate(4.0, False), ["sleep"])
 
 
-def test_sleep_is_ddc_luminance_zero_not_os_display_sleep() -> None:
-    """hardwareBacklight=off reports off on this Samsung while luminance stays 100."""
-    cmds = clapwake.SLEEP_COMMANDS
-    check("sleep is a single command", len(cmds), 1)
-    argv = cmds[0]
-    joined = " ".join(argv)
-    check("sleep uses BetterDisplay", argv[0], clapwake.BETTERDISPLAY_BIN)
-    check("sleep names the Samsung", f"--name={clapwake.DISPLAY_NAME}" in argv, True)
-    check("sleep zeros software brightness", "--brightness=0" in argv, True)
-    check("sleep is DDC luminance", "--ddc" in argv and "--vcp=luminance" in argv, True)
-    check("sleep sets luminance 0", "--value=0" in argv, True)
-    check("sleep is not pmset displaysleepnow", "displaysleepnow" in joined, False)
-    check("sleep is not the no-op hardwareBacklight flag", "--hardwareBacklight=off" in argv, False)
+def test_sleep_dims_with_ddc_before_delayed_backlight_off() -> None:
+    check(
+        "sleep immediately dims with software brightness and DDC",
+        clapwake.SLEEP_COMMANDS,
+        [[
+            clapwake.BETTERDISPLAY_BIN,
+            "set",
+            f"--name={clapwake.DISPLAY_NAME}",
+            "--brightness=0",
+            "--ddc",
+            "--vcp=luminance",
+            "--value=0",
+        ]],
+    )
     wake = clapwake.WAKE_DDC_CMD
+    check("wake turns hardware backlight on", "--hardwareBacklight=on" in clapwake.WAKE_BACKLIGHT_CMD, True)
+    # A dark panel ignores DDC; bundling it with backlight-on fails the whole call.
+    check("backlight-on is not bundled with DDC", "--ddc" in clapwake.WAKE_BACKLIGHT_CMD or "--hardwareBacklight=on" in wake, False)
     check("wake restores brightness", "--brightness=1" in wake, True)
     check("wake restores DDC luminance", "--vcp=luminance" in wake and "--value=100" in wake, True)
+
+
+def test_sleep_never_schedules_backlight_off() -> None:
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, function, args=None, kwargs=None):
+            self.interval = interval
+            timers.append(self)
+
+        def start(self) -> None:
+            pass
+
+    saved = clapwake.threading.Timer
+    clapwake.threading.Timer = FakeTimer  # type: ignore[assignment]
+    try:
+        launched = run_sleep_gate(301.0, False)
+    finally:
+        clapwake.threading.Timer = saved
+    # Backlight-off left the Samsung unrecoverable in software (PROCESS 26).
+    check("sleep starts no delayed backlight-off", len(timers), 0)
+    check("only dimming runs immediately", launched, ["sleep"])
 
 
 def test_unknown_hid_idle_does_not_suppress() -> None:
@@ -399,12 +597,12 @@ def test_human_hid_after_own_wake_still_sleeps() -> None:
 # --- actions are durable: re-fired until the panel reads back at target -----
 
 
-def test_sleep_retries_until_panel_reads_dark() -> None:
-    """A lit read-back retries dimming; a dark read-back stops the retry loop."""
+def test_sleep_retries_until_panel_reads_dimmed() -> None:
+    """A lit read-back retries dimming; a dim read-back stops the retry loop."""
     launched = run_sleep_gate(
         60.0, False, levels=[(1.0, 100.0), (0.0, 0.0)]
     )
-    check("lit read-back re-fires the sleep set", launched, ["sleep", "sleep"])
+    check("lit read-back re-fires dimming", launched, ["sleep", "sleep"])
 
 
 def test_sleep_gives_up_after_bounded_retries() -> None:
@@ -671,6 +869,14 @@ def test_repair_action_starts_and_kicks_a_dead_listener() -> None:
 
 def main() -> int:
     tests = [
+        test_settings_missing_uses_defaults,
+        test_settings_bad_json_uses_defaults,
+        test_settings_invalid_key_preserves_valid_key,
+        test_settings_env_beats_file,
+        test_settings_bounds_and_derived_constants,
+        test_level_feed_udp_payload_and_reset,
+        test_level_feed_send_error_is_ignored,
+        test_callback_to_udp_pipeline,
         test_fast_pair_wakes_immediately,
         test_slow_pair_sleeps_immediately,
         test_wake_needs_no_settle,
@@ -698,11 +904,12 @@ def main() -> int:
         test_first_pair_while_hid_hot_still_sleeps,
         test_sleep_blocked_at_the_login_window,
         test_sleep_fires_when_the_desk_is_idle,
-        test_sleep_is_ddc_luminance_zero_not_os_display_sleep,
+        test_sleep_dims_with_ddc_before_delayed_backlight_off,
+        test_sleep_never_schedules_backlight_off,
         test_unknown_hid_idle_does_not_suppress,
         test_sleep_after_own_wake_hid_still_fires,
         test_human_hid_after_own_wake_still_sleeps,
-        test_sleep_retries_until_panel_reads_dark,
+        test_sleep_retries_until_panel_reads_dimmed,
         test_sleep_gives_up_after_bounded_retries,
         test_levels_are_dark_reads_either_channel,
         test_levels_at_target_needs_both_channels,

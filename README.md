@@ -5,8 +5,8 @@ The microphone must receive each sound above the configured onset threshold.
 
 | Monitor state | Two claps/snaps do this |
 |---|---|
-| Lit | Set software brightness to 0 and DDC luminance to 0 |
-| Dim | Set software brightness to 1 and DDC luminance to 100 |
+| Lit | Dim to software brightness 0 and DDC luminance 0 |
+| Dim or backlight off | Turn the backlight on and restore software brightness and DDC luminance |
 
 The default gap between sounds is **0.12–1.20 seconds**, with a 5 ms boundary
 tolerance. Faster onsets are treated as echoes. An onset beyond the window starts
@@ -15,18 +15,22 @@ a new pair. There is no fast-for-wake or slow-for-sleep split.
 ## Behavior and safeguards
 
 - BetterDisplay reads software brightness and DDC luminance from `LS32CG51x`.
-  Either channel near zero means dim. If both reads fail, the pair requests wake.
-- Dimming changes monitor brightness, not macOS display power. It does not call
-  `pmset displaysleepnow`, which can trigger clamshell sleep and locking.
+  Either channel near zero means dark. If both reads fail, the pair requests wake.
+- Sleep sets software brightness and DDC luminance to zero. It never turns
+  the hardware backlight off: once off, no software path turned the Samsung
+  back on (PROCESS part 26).
+- Neither action calls `pmset displaysleepnow`, which can trigger clamshell sleep
+  and locking.
 - Wake uses F18 HID events, IOPM activity, `caffeinate`, and BetterDisplay.
   Sparse pulses at 0, 0.8, 2, and 4 seconds cover deep DisplayPort idle.
 - Read-back checks log `sleep_verify` or `wake_verify`. A mismatch can trigger up
-  to four extra brightness commands. Exhaustion logs an `*_unverified` error.
+  to four extra display commands. Exhaustion logs an `*_unverified` error.
   The final extra command is not followed by another check.
-- Dimming requires an unlocked session. The login window logs `sleep_suppressed`.
+- Starting the sleep sequence requires an unlocked session. The login window
+  logs `sleep_suppressed`.
   Recent keyboard or mouse input does not block a clap pair. Wake does not use
   this guard.
-- Onset threshold is `0.35`; release level is `0.08`. Quiet rearming, echo
+- Onset threshold is `0.55`; release level is `0.08`. Quiet rearming, echo
   rejection, and a busy-room gate reduce false triggers from tails and audio.
 - Capture stays pinned to the Scarlett by name. The listener retries missing
   devices, reconnects stalled streams, and requests process restarts for repeated
@@ -34,7 +38,7 @@ a new pair. There is no fast-for-wake or slow-for-sleep split.
 
 ## Files
 
-- `clapwake.py`: detection, brightness decisions, wake/dim actions, capture recovery.
+- `clapwake.py`: detection, display-state decisions, wake/sleep actions, capture recovery.
 - `hostwatch.py`: power-source and microphone-index change detection.
 - `check_clapwake.py`: health report; `--repair` can bootstrap or restart the listener.
 - `scope.py`: microphone meter using the same detector with actions stubbed out.
@@ -84,7 +88,7 @@ LaunchAgent environment overrides:
 
 - `CLAPWAKE_MIC_NAME`: preferred microphone name substring; default `Scarlett`.
 - `CLAPWAKE_WAKE_MIN_GAP` / `CLAPWAKE_WAKE_MAX_GAP`: the shared pair window.
-  Bounds must satisfy `0.12 <= min < max <= 1.50`.
+  Bounds must satisfy `0.12 <= min < max <= 2.50`.
 
 Logs are `/tmp/clapwake.out` and `/tmp/clapwake.err`. A trigger records a request;
 read-back records whether both brightness channels reached their target range.
@@ -99,3 +103,26 @@ Some diagnostic field names retain the older wake/sleep-band terminology.
 
 These are offline tests with simulated peaks and stubbed actions. They do not
 replace a physical clap/snap test on the configured microphone and monitor.
+
+## Menu bar
+
+Requires macOS 14 or later and the Swift command line tools. Run
+`bash menubar/build.sh`. The app is `menubar/build/Clapwake Bar.app`.
+Use `bash menubar/build.sh --install` to copy it to `~/Applications/`.
+The supplied `com.you.clapwake.bar.plist` starts that copy at login.
+Set its app path before you install the plist in `~/Library/LaunchAgents/`.
+The build does not install or start either LaunchAgent.
+
+The panel shows the mic level and recent events. It controls the listener and
+keep-awake state. Turn keep-awake off before you pack the Mac. A power change
+can require an administrator password. The app does not store the password.
+The listener must run the new code to send levels on `127.0.0.1:47811`.
+
+Settings use `~/Library/Application Support/clapwake/settings.json`.
+`CLAPWAKE_SETTINGS` changes this path. Set it for both app and listener.
+The keys are `threshold` (0.20–0.90) and `max_gap_s` (0.50–2.50).
+The threshold must exceed twice the release level. The gap must exceed the
+minimum gap. Environment gap values take priority. A panel change saves the
+file and restarts the listener. "Applied" confirms a matching listening event.
+The app uses `~/clapwake` for the health check. Set `CLAPWAKE_DIR` to use
+another repository path.
